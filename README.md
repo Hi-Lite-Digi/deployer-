@@ -78,6 +78,7 @@ region, server access and domain. No AWS resources are created by changing or pu
 ## Documentation
 
 - [AWS hosting and GitHub push-to-deploy setup](docs/AWS_HOSTING.md)
+- [Interactive Vercel preview with simulated builds](docs/VERCEL_PREVIEW.md)
 - [Full documentation index and historical guides](docs/README.md)
 
 ## Roadmap

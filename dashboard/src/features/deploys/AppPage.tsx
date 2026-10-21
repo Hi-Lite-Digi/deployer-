@@ -107,12 +107,12 @@ export function AppPage() {
         ))}
         {a.local_url && (
           <span className="text-xs text-muted">
-            On this server:{" "}
+            {import.meta.env.MODE === "demo" ? "Sample preview: " : "On this server: "}
             <a href={a.local_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-mono text-accent hover:underline">
               {a.local_url.replace(/^https?:\/\//, "")}
               <ExternalLink className="size-3" />
             </a>
-            {a.urls.length === 0 && " (add a domain in Settings to reach it from the internet)"}
+            {import.meta.env.MODE !== "demo" && a.urls.length === 0 && " (add a domain in Settings to reach it from the internet)"}
           </span>
         )}
       </div>

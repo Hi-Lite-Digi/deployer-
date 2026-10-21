@@ -26,8 +26,16 @@ export function AppSettings(props: Props) {
       <GeneralCard {...props} />
       {props.app.target !== "local" && <BuildCard projectId={props.projectId} app={props.app} isAdmin={props.isAdmin} />}
       <EnvCard {...props} />
-      <WebhookCard {...props} />
-      <DomainsCard {...props} />
+      {import.meta.env.MODE === "demo" ? (
+        <Card title="GitHub pushes & domains" description="This preview does not connect to GitHub or change DNS.">
+          <p className="text-sm text-muted">Use Deploy now to try a simulated update. Real push deployments and custom domains require the hosted backend.</p>
+        </Card>
+      ) : (
+        <>
+          <WebhookCard {...props} />
+          <DomainsCard {...props} />
+        </>
+      )}
       {props.isAdmin && <DeleteCard {...props} />}
     </div>
   );
@@ -180,7 +188,9 @@ function EnvCard({ projectId, app, isAdmin }: Props) {
     <Card
       title="Environment variables"
       description={
-        app.target === "local"
+        import.meta.env.MODE === "demo"
+          ? "Use sample values. This demo saves variable names only and discards their values."
+          : app.target === "local"
           ? "Stored encrypted; PORT, DEPLOYER_URL and DEPLOYER_PROJECT_ID are always added."
           : secrets
             ? "Stored encrypted and sent to the cloud service as its environment (plus DEPLOYER_DB_* for the project's databases in the same cloud account when the app has database access) - nothing that points at this PC. Saving publishes the live version again with the new values right away."

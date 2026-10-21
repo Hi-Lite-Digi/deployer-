@@ -83,7 +83,7 @@ export function NewAppDialog({ projectId, isAdmin, onClose }: { projectId: strin
 
   if (step === "repo") {
     return (
-      <Dialog open onClose={onClose} title="New app" description="Choose a repository. Deployer reads it and fills in the build settings for you." size="lg" dismissible={!detect.isPending}>
+      <Dialog open onClose={onClose} title="New app" description={import.meta.env.MODE === "demo" ? "Choose a sample repository to try the simulated deployment flow." : "Choose a repository. Deployer reads it and fills in the build settings for you."} size="lg" dismissible={!detect.isPending}>
         <RepoStep
           projectId={projectId}
           busy={detect.isPending}
@@ -139,10 +139,10 @@ export function NewAppDialog({ projectId, isAdmin, onClose }: { projectId: strin
         {draft.use_github_connection && (
           <p className="flex items-center gap-2 text-xs text-muted">
             <GitHubIcon className="size-3.5 shrink-0" />
-            Cloned with your GitHub connection; the push webhook is added automatically.
-            <button type="button" className="font-medium text-accent hover:underline" onClick={() => setDraft((d) => ({ ...d, use_github_connection: false, private_repo: true }))} disabled={pending}>
+            {import.meta.env.MODE === "demo" ? "Sample connection. No GitHub access or push webhook is created." : "Cloned with your GitHub connection; the push webhook is added automatically."}
+            {import.meta.env.MODE !== "demo" && <button type="button" className="font-medium text-accent hover:underline" onClick={() => setDraft((d) => ({ ...d, use_github_connection: false, private_repo: true }))} disabled={pending}>
               Use a token instead
-            </button>
+            </button>}
           </p>
         )}
         <AppFormFields
@@ -157,7 +157,7 @@ export function NewAppDialog({ projectId, isAdmin, onClose }: { projectId: strin
         <div className="space-y-1.5">
           <p className="text-sm font-medium">Environment variables</p>
           <p className="text-xs text-muted">
-            Stored encrypted and injected at runtime. PORT, DEPLOYER_URL and DEPLOYER_PROJECT_ID are always set.
+            {import.meta.env.MODE === "demo" ? "Use sample values. This demo saves variable names only and discards their values." : "Stored encrypted and injected at runtime. PORT, DEPLOYER_URL and DEPLOYER_PROJECT_ID are always set."}
             {missing.length > 0 && <span className="text-warning"> From the repository's .env example — fill in {missing.length === 1 ? "this value" : `these ${missing.length} values`} (or remove unused ones).</span>}
           </p>
           <EnvEditor rows={env} onChange={setEnv} disabled={pending} required={detected?.env_keys} />
@@ -255,7 +255,7 @@ function RepoList({ login, busy, onPick }: { login: string; busy: boolean; onPic
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between gap-2">
-        <p className="text-sm font-medium">Your repositories</p>
+        <p className="text-sm font-medium">{import.meta.env.MODE === "demo" ? "Sample repositories" : "Your repositories"}</p>
         <p className="truncate text-xs text-muted">
           <GitHubIcon className="mr-1 inline size-3.5 align-[-2px]" />
           {login}

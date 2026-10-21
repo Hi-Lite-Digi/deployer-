@@ -6,6 +6,7 @@ import { App } from "./App";
 import { AuthProvider } from "./auth/AuthProvider";
 import { ThemeProvider } from "./components/ThemeProvider";
 import { ToastProvider } from "./components/ui/Toaster";
+import { DemoBanner } from "./demo/DemoBanner";
 import "./index.css";
 
 const queryClient = new QueryClient({
@@ -31,9 +32,12 @@ createRoot(root).render(
     <QueryClientProvider client={queryClient}>
       <ThemeProvider>
         <ToastProvider>
-          <AuthProvider>
-            <App />
-          </AuthProvider>
+          <div className={import.meta.env.MODE === "demo" ? "pb-28 sm:pb-16" : undefined}>
+            <AuthProvider>
+              <App />
+            </AuthProvider>
+          </div>
+          {import.meta.env.MODE === "demo" && <DemoBanner />}
         </ToastProvider>
       </ThemeProvider>
     </QueryClientProvider>

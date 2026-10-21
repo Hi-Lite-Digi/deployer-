@@ -42,8 +42,7 @@ export function DeploysTab() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <p className="max-w-2xl text-sm text-muted">
-          Import a GitHub repository to get started. Every push to your production branch builds and deploys the latest
-          version. View logs or roll back to an earlier deployment here.
+          {import.meta.env.MODE === "demo" ? "Import a sample repository, watch a simulated build, or try a rollback. Real GitHub pushes are not connected in this preview." : "Import a GitHub repository to get started. Every push to your production branch builds and deploys the latest version. View logs or roll back to an earlier deployment here."}
         </p>
         {newApp}
       </div>
@@ -87,7 +86,7 @@ export function DeploysTab() {
                   rel="noreferrer"
                   className="relative z-10 inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
                 >
-                  {a.urls[0] ? "" : "On this server: "}
+                  {import.meta.env.MODE === "demo" ? "Sample preview: " : a.urls[0] ? "" : "On this server: "}
                   {(a.urls[0] ?? a.local_url ?? "").replace(/^https?:\/\//, "")}
                   <ExternalLink className="size-3" />
                 </a>

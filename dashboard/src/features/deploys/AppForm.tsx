@@ -97,7 +97,7 @@ export function AppFormFields({
         </Field>
       </div>
 
-      {!hideRepoAccess && (
+      {import.meta.env.MODE !== "demo" && !hideRepoAccess && (
         <Checkbox
           label="Private repository"
           description="Deployer clones with a GitHub fine-grained token (Repository permissions → Contents: Read). It is stored encrypted and never logged."
@@ -106,7 +106,7 @@ export function AppFormFields({
           disabled={disabled}
         />
       )}
-      {!hideRepoAccess && draft.private_repo && (
+      {import.meta.env.MODE !== "demo" && !hideRepoAccess && draft.private_repo && (
         <>
           <RepoTokenSteps repoUrl={draft.repo_url} />
           <Field label="GitHub token" optional={hasRepoToken} hint={hasRepoToken ? "A token is stored. Leave blank to keep it." : undefined}>
@@ -153,7 +153,7 @@ export function AppFormFields({
 
       <TargetChooser projectId={projectId} draft={draft} onChange={onChange} isAdmin={isAdmin} error={errors.target} disabled={disabled} />
 
-      <p className="text-xs text-muted">Pushes to the selected branch automatically build and deploy your app. Connect external services using environment variables.</p>
+      <p className="text-xs text-muted">{import.meta.env.MODE === "demo" ? "Builds are simulated here. Real GitHub push deployments require the hosted Docker worker." : "Pushes to the selected branch automatically build and deploy your app. Connect external services using environment variables."}</p>
     </div>
   );
 }

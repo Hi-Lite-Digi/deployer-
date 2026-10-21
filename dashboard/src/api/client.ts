@@ -273,4 +273,9 @@ export function saveBlob({ blob, filename }: DownloadResult): void {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-export const client = createApiClient();
+// The demo transport is excluded from normal builds and never falls through to a live API.
+export const client = createApiClient(
+  import.meta.env.MODE === "demo"
+    ? { fetch: async (input, init) => (await import("../demo/api")).demoFetch(input, init) }
+    : {},
+);

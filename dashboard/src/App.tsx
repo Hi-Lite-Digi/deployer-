@@ -20,6 +20,7 @@ import { InstanceSettingsPage } from "./features/settings/InstanceSettingsPage";
 import { MonitoringPage } from "./features/monitoring/MonitoringPage";
 import { RemoteAccessPage } from "./features/remote-access/RemoteAccessPage";
 import { SetupWizard } from "./features/setup/SetupWizard";
+import { DemoSite } from "./demo/DemoSite";
 
 function RouteError() {
   const error = useRouteError();
@@ -45,6 +46,7 @@ function NotFound() {
 }
 
 const router = createBrowserRouter([
+  { path: "/demo/site/:appId", element: import.meta.env.MODE === "demo" ? <DemoSite /> : <NotFound /> },
   {
     element: <SetupGate />,
     errorElement: <RouteError />,
