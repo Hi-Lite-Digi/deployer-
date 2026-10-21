@@ -1186,7 +1186,12 @@ cmd_uninstall() {
       # shellcheck disable=SC2086
       if [ "$KEEP_DATA" = 1 ]; then docker stop $ids >/dev/null; else docker rm -f $ids >/dev/null; fi
     fi
-    if [ "$KEEP_DATA" = 1 ]; then dc --profile mongodb down --remove-orphans || true; else dc --profile mongodb down --remove-orphans --volumes || true; fi
+    # Optional services can still exist after their profile was disabled in .env.
+    if [ "$KEEP_DATA" = 1 ]; then
+      dc --profile mongodb --profile legacy-baas down --remove-orphans || true
+    else
+      dc --profile mongodb --profile legacy-baas down --remove-orphans --volumes || true
+    fi
     ok 'Containers removed'
   else
     warn 'Docker engine not reachable; containers were not removed.'

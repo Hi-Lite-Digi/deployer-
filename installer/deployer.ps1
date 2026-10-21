@@ -827,7 +827,8 @@ function Invoke-Uninstall {
     }
 
     if (Test-DeployerDockerEngine -Runtime $ctx.Runtime) {
-        $downArgs = @('--profile', 'mongodb', 'down', '--remove-orphans')
+        # Include optional services left from an earlier installation.
+        $downArgs = @('--profile', 'mongodb', '--profile', 'legacy-baas', 'down', '--remove-orphans')
         if (-not $KeepData) { $downArgs += '--volumes' }
         [void](Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments $downArgs)
         Write-DeployerOk 'Containers removed'
