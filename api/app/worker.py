@@ -1,0 +1,326 @@
+"""Deployer worker: `python -m app.worker` (docs/BACKUPS.md "Jobs").
+
+Threads started by `start_background_tasks()`:
+
+- `runner-N` (WORKER_CONCURRENCY, default 2): BLPOP `jobs:queue` and run jobs (`jobs.run_job`). Jobs
+  for sources on a host device run here too: backup jobs orchestrate from here and use device executors.
+- `scheduler`: leader election via Redis `SET scheduler:leader <id> NX PX 30000`, renewed every 10 s.
+  The leader fails stale `running` jobs, re-dispatches lost `queued` jobs and enqueues due work
+  (`backups.scheduler_tick`: snapshots per policy, log archiving - MariaDB 5 min / MongoDB 1 min -,
+  hourly pruning incl. purging sources deleted > 30 days ago, weekly verification, daily platform
+  snapshot), points a quick-tunnel `public_url` at the tunnel's current hostname after a restart
+  (`remote_access.follow_quick_url`) and once a day prunes the query log, audit rows > 90 days and
+  expired refresh tokens.
+- `mongo-replset`: initiates the managed MongoDB single-node replica set on first start/upgrade.
+- `source-sync`: while this worker leads the scheduler, a co-hosting sync round every 2 s for each
+  syncing database copy (docs/COHOSTING.md, `source_sync.sync_loop`).
+- `app-logs`: every 10 s copies new `docker logs` lines of live app containers into Redis
+  (docs/DEPLOYMENTS.md); the scheduler tick also removes orphan app containers and reconciles the
+  co-hosted app copies on devices (docs/COHOSTING.md, `cohost_apps.sweep`).
+- `metrics`: every 15 s samples host metrics and container stats into Redis (docs/MONITORING.md); the
+  scheduler leader evaluates the alert rules once a minute (`alerts.evaluate`).
+- any task added with `register_background_task(name, fn)`.
+
+Extension point (host devices): call `register_background_task("device-agent", fn)` before
+`start_background_tasks()` runs - e.g. from a module listed in `WORKER_PLUGINS` (comma-separated
+module names imported at startup) - where `fn(stop: threading.Event)` blocks until `stop` is set.
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+import os
+import signal
+import socket
+import threading
+import time
+import uuid
+from collections.abc import Callable
+
+import redis
+from redis.exceptions import WatchError
+
+from app.config import get_settings, seal_process
+from app.services import jobs, provisioning
+
+log = logging.getLogger("app.worker")
+
+LEADER_KEY = "scheduler:leader"
+LEADER_TTL_MS = 30_000
+RENEW_EVERY_S = 10
+TICK_EVERY_S = 15
+WORKER_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+
+BackgroundTask = Callable[[threading.Event], None]
+_tasks: list[tuple[str, BackgroundTask]] = []
+
+
+def register_background_task(name: str, fn: BackgroundTask) -> None:
+    """Adds a long-running task `fn(stop_event)` to the worker (started by start_background_tasks)."""
+    _tasks.append((name, fn))
+
+
+def _worker_redis() -> redis.Redis:
+    # Own connection with a socket timeout longer than the BLPOP timeout.
+    return redis.Redis.from_url(
+        get_settings().redis_url, decode_responses=True, socket_timeout=30, socket_connect_timeout=5
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# runner
+# ---------------------------------------------------------------------------------------------
+
+
+def runner_loop(stop: threading.Event, client_factory: Callable[[], redis.Redis] = _worker_redis) -> None:
+    client = None
+    while not stop.is_set():
+        try:
+            if client is None:
+                client = client_factory()
+            item = client.blpop([jobs.QUEUE_KEY], timeout=5)
+        except redis.RedisError as exc:
+            log.warning("queue unavailable: %s", exc)
+            client = None
+            stop.wait(3)
+            continue
+        if not item:
+            continue
+        job_id = item[1]
+        try:
+            status = jobs.run_job(job_id)
+            if status:
+                log.info("job %s finished: %s", job_id, status)
+        except Exception:  # noqa: BLE001 - keep the runner alive
+            log.exception("running job %s crashed", job_id)
+
+
+# ---------------------------------------------------------------------------------------------
+# scheduler
+# ---------------------------------------------------------------------------------------------
+
+
+def acquire_leadership(client: redis.Redis, me: str = WORKER_ID) -> bool:
+    if client.set(LEADER_KEY, me, nx=True, px=LEADER_TTL_MS):
+        return True
+    with client.pipeline() as pipe:
+        try:
+            pipe.watch(LEADER_KEY)
+            if pipe.get(LEADER_KEY) != me:
+                pipe.unwatch()
+                return False
+            pipe.multi()
+            pipe.pexpire(LEADER_KEY, LEADER_TTL_MS)
+            pipe.execute()
+            return True
+        except WatchError:
+            return False
+
+
+def release_leadership(client: redis.Redis, me: str = WORKER_ID) -> None:
+    with client.pipeline() as pipe:
+        try:
+            pipe.watch(LEADER_KEY)
+            if pipe.get(LEADER_KEY) == me:
+                pipe.multi()
+                pipe.delete(LEADER_KEY)
+                pipe.execute()
+            else:
+                pipe.unwatch()
+        except (WatchError, redis.RedisError):
+            pass
+
+
+PRUNE_QUERY_LOG_EVERY_S = 24 * 3600
+_last_query_log_prune = float("-inf")  # module-level: the leader is one process, ticks every TICK_EVERY_S
+_last_alerts = float("-inf")
+
+
+def scheduler_tick() -> None:
+    global _last_query_log_prune, _last_alerts
+    from app.services import (
+        alerts,
+        audit,
+        backups,
+        cloud_db,
+        cohost_apps,
+        deployments,
+        github_actions,
+        query_log,
+        remote_access,
+    )
+
+    jobs.recover_stale()
+    try:
+        with jobs.get_sessionmaker()() as session:
+            remote_access.follow_quick_url(session)  # A-136: a restarted quick tunnel has a new hostname
+    except Exception:  # noqa: BLE001 - never skip the backups/deploy work below over this
+        log.exception("could not follow the quick-tunnel URL")
+    jobs.redispatch_queued()
+    if get_settings().legacy_baas_enabled:
+        backups.scheduler_tick(jobs.get_sessionmaker())
+    deployments.scheduler_tick(jobs.get_sessionmaker())
+    if get_settings().legacy_baas_enabled:
+        cohost_apps.sweep(jobs.get_sessionmaker())  # docs/COHOSTING.md: co-hosted apps on devices
+    try:  # docs/CLOUD.md "C2": AWS databases Deployer created let this PC's current public IP in
+        if get_settings().legacy_baas_enabled:
+            cloud_db.refresh_pc_ips(jobs.get_sessionmaker())
+    except Exception:  # noqa: BLE001 - never skip the work below over this
+        log.exception("could not follow this PC's public IP on cloud databases")
+    try:  # docs/CLOUD.md "C3": GitHub Actions runs that finished while this PC was off become deployments
+        github_actions.reconcile(jobs.get_sessionmaker())
+    except Exception:  # noqa: BLE001 - never skip the work below over this
+        log.exception("could not record GitHub Actions runs")
+    if time.monotonic() - _last_alerts >= alerts.EVALUATE_EVERY_S:
+        _last_alerts = time.monotonic()
+        alerts.evaluate(jobs.get_sessionmaker())  # docs/MONITORING.md
+    if time.monotonic() - _last_query_log_prune >= PRUNE_QUERY_LOG_EVERY_S:
+        _last_query_log_prune = time.monotonic()
+        with jobs.get_sessionmaker()() as session:
+            pruned = query_log.prune(session) + audit.prune(session)  # A-102
+            session.commit()
+        if pruned:
+            log.info("pruned %d query log / audit / expired session row(s)", pruned)
+
+
+def scheduler_loop(stop: threading.Event, client_factory: Callable[[], redis.Redis] = _worker_redis) -> None:
+    client = None
+    leader = False
+    last_tick = 0.0
+    while not stop.is_set():
+        try:
+            if client is None:
+                client = client_factory()
+            now_leader = acquire_leadership(client)
+            if now_leader != leader:
+                log.info("scheduler leadership %s", "acquired" if now_leader else "lost")
+            leader = now_leader
+            if leader and time.monotonic() - last_tick >= TICK_EVERY_S:
+                last_tick = time.monotonic()
+                try:
+                    scheduler_tick()
+                except Exception:  # noqa: BLE001
+                    log.exception("scheduler tick failed")
+        except redis.RedisError as exc:
+            log.warning("scheduler: redis unavailable: %s", exc)
+            client, leader = None, False
+        stop.wait(min(RENEW_EVERY_S, TICK_EVERY_S))
+    if client is not None and leader:
+        release_leadership(client)
+
+
+def mongo_replset_loop(stop: threading.Event) -> None:
+    from app.services.backup_engine import ensure_mongo_replica_set
+
+    while not stop.is_set():
+        status = ensure_mongo_replica_set()
+        if status in ("ok", "initiated", "disabled", "no_replset"):
+            if status == "initiated":
+                log.info("initiated the MongoDB replica set rs0")
+            elif status == "no_replset":
+                log.warning("managed MongoDB runs without --replSet: MongoDB point-in-time recovery is unavailable")
+            return
+        log.info("MongoDB replica set not ready yet (%s); retrying", status)
+        stop.wait(10)
+
+
+# ---------------------------------------------------------------------------------------------
+# process
+# ---------------------------------------------------------------------------------------------
+
+
+def _load_plugins() -> None:
+    for name in filter(None, (m.strip() for m in os.environ.get("WORKER_PLUGINS", "").split(","))):
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001
+            log.exception("could not load worker plugin %s", name)
+
+
+def start_background_tasks(stop: threading.Event, *, concurrency: int | None = None) -> list[threading.Thread]:
+    concurrency = concurrency or max(1, int(os.environ.get("WORKER_CONCURRENCY", "2")))
+    specs: list[tuple[str, BackgroundTask]] = [(f"runner-{i + 1}", runner_loop) for i in range(concurrency)]
+    from app.services import deployments, metrics, source_sync
+
+    specs += [
+        ("scheduler", scheduler_loop),
+        ("app-logs", deployments.logs_loop),
+        ("metrics", metrics.sample_loop),
+        *_tasks,
+    ]
+    if get_settings().legacy_baas_enabled:
+        specs += [("mongo-replset", mongo_replset_loop), ("source-sync", source_sync.sync_loop)]
+    threads = []
+    for name, fn in specs:
+        thread = threading.Thread(target=_guard(name, fn, stop), name=name, daemon=True)
+        thread.start()
+        threads.append(thread)
+    return threads
+
+
+def _guard(name: str, fn: BackgroundTask, stop: threading.Event) -> Callable[[], None]:
+    def run() -> None:
+        while not stop.is_set():
+            try:
+                fn(stop)
+                return
+            except Exception:  # noqa: BLE001 - restart crashed loops
+                log.exception("background task %s crashed; restarting in 5 s", name)
+                stop.wait(5)
+
+    return run
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    seal_process()  # SECURITY.md "Query console": no child process (git, builds, dumps) inherits the secrets
+    log.info("worker %s starting", WORKER_ID)
+    if get_settings().legacy_baas_enabled:
+        _load_plugins()
+    try:
+        failed = jobs.recover_stale()
+        if failed:
+            log.warning("marked %d interrupted job(s) as failed", failed)
+    except Exception:  # noqa: BLE001 - the database may still be starting; the scheduler retries
+        log.warning("could not check for interrupted jobs yet", exc_info=True)
+    from app.services import backup_engine, executors, remote_access
+
+    if remote_access.fix_state_ownership():
+        log.info("gave the tunnel state volume back to uid 10001")
+
+    swept = backup_engine.sweep_leftovers(executors.backup_root())
+    if any(swept.values()):
+        log.info("removed leftovers of interrupted backup jobs: %s", swept)
+    try:
+        capped = provisioning.cap_mariadb_users() if get_settings().legacy_baas_enabled else 0
+        if capped:
+            log.info("applied the connection cap to %d managed database user(s)", capped)
+    except Exception:  # noqa: BLE001 - new users still get the cap; retried on the next start
+        log.warning("could not apply the managed database connection cap", exc_info=True)
+    stop = threading.Event()
+
+    def _signal(signum, _frame) -> None:
+        log.info("received signal %s, stopping", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _signal)
+    signal.signal(signal.SIGINT, _signal)
+    threads = start_background_tasks(stop)
+    while not stop.is_set():
+        stop.wait(1)
+    for thread in threads:
+        thread.join(timeout=5)
+    log.info("worker stopped")
+
+
+if __name__ == "__main__":
+    # `python -m app.worker` runs this file as `__main__`. Plugins do `from app import worker`, which
+    # would import a *second* copy of this module with its own task registry, so their background
+    # tasks would never start. Hand off to the canonical module so both sides share one registry.
+    from app.worker import main as _canonical_main
+
+    _canonical_main()

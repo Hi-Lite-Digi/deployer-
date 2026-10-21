@@ -1,0 +1,1764 @@
+// Types copied from docs/API.md (the HTTP contract). Keep in sync with the API.
+
+export type ProviderName = "google" | "github";
+
+export type User = {
+  id: string;
+  email: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  is_instance_owner: boolean;
+  /** False once the instance owner disabled the account (A-023). */
+  is_active: boolean;
+  has_password: boolean;
+  created_at: string;
+  identities: Identity[];
+};
+
+export type Identity = {
+  id: string;
+  provider: ProviderName;
+  provider_email: string | null;
+  provider_username: string | null;
+  created_at: string;
+};
+
+export type AuthResponse = {
+  access_token: string;
+  token_type: "bearer";
+  expires_in: number;
+  user: User;
+};
+
+export type Role = "owner" | "admin" | "developer" | "viewer";
+
+export type Project = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  owner_id: string;
+  my_role: Role;
+  created_at: string;
+  updated_at: string;
+  data_source_counts: { sql: number; nosql: number };
+};
+
+export type Member = {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  role: Role;
+  /** docs/COHOSTING.md "Roles": may keep a live copy of the project's databases on their own PC. */
+  can_cohost?: boolean;
+  created_at: string;
+};
+
+export type Invite = {
+  id: string;
+  email: string | null;
+  role: Exclude<Role, "owner">;
+  invited_by: string;
+  expires_at: string;
+  created_at: string;
+};
+
+export type DataSourceKind = "sql" | "nosql";
+/** `dynamodb`: tables in the user's AWS account (docs/CLOUD.md "C2-2"); `firestore`: a Firebase project's Cloud
+ * Firestore database ("C2-3"), both browsed like MongoDB collections; `firebase_rtdb`: a Firebase Realtime Database
+ * ("C2-4"), one JSON tree browsed by path. */
+export type DataSourceEngine =
+  | "mariadb"
+  | "mysql"
+  | "postgresql"
+  | "mongodb"
+  | "dynamodb"
+  | "firestore"
+  | "firebase_rtdb";
+
+export type DataSource = {
+  id: string;
+  project_id: string;
+  name: string;
+  kind: DataSourceKind;
+  engine: DataSourceEngine;
+  mode: "managed" | "external";
+  database_name: string;
+  /** `creating`: a database being created in the user's cloud account (docs/CLOUD.md "C2"). */
+  status: "ok" | "error" | "unknown" | "creating";
+  status_message: string | null;
+  last_checked_at: string | null;
+  display: {
+    host: string | null;
+    port: number | null;
+    username: string | null;
+    tls: boolean;
+  };
+  created_at: string;
+  /** Host device (docs/DEVICES.md). `null`/absent = main server. */
+  device_id?: string | null;
+  /** Name of the host device (DEVICES.md); the dashboard looks the device up itself if absent. */
+  device_name?: string | null;
+  /** Live copies on co-host devices (docs/COHOSTING.md); empty/absent when there are none. */
+  replicas?: Replica[];
+  /** docs/CLOUD.md "C2": the database lives in the user's own AWS account; null otherwise. */
+  cloud?: DataSourceCloud | null;
+};
+
+export type DataSourceCloud = {
+  provider: "aws" | "firebase";
+  connection_id: string | null;
+  connection_name: string | null;
+  service: string;
+  /** True: Deployer created it (and deletes it, after a final snapshot). False: an existing one connected. */
+  created: boolean;
+  resource_id: string | null;
+  resource_kind: "instance" | "cluster" | "table" | "database";
+  /** DynamoDB: the tables this database holds. */
+  tables?: string[] | null;
+  /** Firestore / Realtime Database: the Google project the database is in. */
+  project_id?: string | null;
+  /** Realtime Database: its URL. */
+  url?: string | null;
+  region: string | null;
+  instance_class: string | null;
+  /** This PC's public IP the database's firewall lets in (created databases). */
+  allowed_ip: string | null;
+  /** The job creating it. */
+  job_id: string | null;
+  /** DynamoDB: what this table was restored from (a backup or a point in time of another source's table). */
+  restored_from?: CloudRestoredFrom | null;
+  resources: string[];
+  when_pc_off: string;
+};
+
+export type CloudRestoredFrom = {
+  kind: "backup" | "point_in_time";
+  table: string;
+  backup?: string | null;
+  time?: string;
+  latest?: boolean;
+  source_name?: string;
+};
+
+export type DatabaseLocation = {
+  id: "local" | "external" | "aws" | "firebase";
+  label: string;
+  what: string;
+  when_pc_off: string;
+  cost: string;
+  available?: boolean;
+  /** Only for this kind of database (Firebase: NoSQL, Cloud Firestore). */
+  only?: DataSourceKind;
+  note?: string;
+};
+
+export type CloudDatabaseOptions = {
+  locations: DatabaseLocation[];
+  aws: {
+    engines: SqlExternalEngine[];
+    instance_classes: { id: string; description: string }[];
+    default_instance_class: string;
+    storage_gb: number;
+    backup_days: number;
+    cost: string;
+    network: string;
+  };
+  dynamodb: {
+    what: string;
+    keys: string;
+    key_types: { id: DynamoKeyType; label: string }[];
+    cost: string;
+    network: string;
+  };
+  /** `short`: one plain sentence on how it differs from the other Firebase database. */
+  firestore: {
+    short: string;
+    what: string;
+    connect: string;
+    cost: string;
+    network: string;
+    /** Creating a new Firestore database (docs/CLOUD.md "Firestore backups"). */
+    create_cost: string;
+    locations: { id: string; label: string }[];
+  };
+  rtdb: {
+    short: string;
+    what: string;
+    connect: string;
+    cost: string;
+    network: string;
+    locations: { id: string; label: string }[];
+  };
+};
+
+/** A Realtime Database of a Firebase project (`problem`: why Deployer can't use it). */
+export type RtdbInstance = {
+  id: string;
+  url: string | null;
+  location: string | null;
+  type: string | null;
+  state: string;
+  problem: string | null;
+};
+
+/** `GET .../rtdb`: the value at a path; `children` (in Firebase's order) for shallow or ordered reads. */
+export type RtdbRead = {
+  path: string;
+  value: JsonValue;
+  children?: { key: string; value: JsonValue }[];
+};
+
+/** A Firestore database of a Firebase project (`problem`: why Deployer can't use it). */
+export type FirestoreDatabase = {
+  id: string;
+  location: string | null;
+  type: string | null;
+  problem: string | null;
+};
+
+/** docs/CLOUD.md "Firestore backups": a Firestore database's schedules, backups and managed exports / imports. */
+export type FirestoreSchedule = {
+  id: string;
+  recurrence: "daily" | "weekly";
+  day: string | null;
+  retention_days: number | null;
+  created_at: string | null;
+};
+
+export type FirestoreBackup = {
+  /** The full name restore takes. */
+  name: string;
+  id: string;
+  location: string | null;
+  state: string | null;
+  snapshot_time: string | null;
+  expire_time: string | null;
+  size_bytes: number | null;
+  documents: number | null;
+};
+
+export type FirestoreOperation = {
+  id: string;
+  kind: "export" | "import";
+  done: boolean;
+  state: string;
+  /** The export's gs:// folder (what an import takes). */
+  uri: string | null;
+  collections: string[];
+  documents: number | null;
+  started_at: string | null;
+  ended_at: string | null;
+  error: string | null;
+};
+
+export type FirestoreBackups = {
+  database: string;
+  location: string | null;
+  bucket: string | null;
+  default_bucket: string;
+  days: string[];
+  max_retention_days: { daily: number; weekly: number };
+  costs: { export: string; import: string; schedule: string; restore: string; pitr: string; clone: string };
+  notes: { export: string; restore: string; pitr: string };
+  /** Why a part is empty when the service account may not read it. */
+  problems: Partial<Record<"status" | "schedules" | "backups" | "operations" | "exports", string>>;
+  /** Point-in-time recovery and Google's delete protection (null when the database could not be read). */
+  status: { pitr: boolean; earliest_version_time: string | null; delete_protection: boolean } | null;
+  /** Exports Deployer made of this database in its deployer-* bucket, newest first (deletable here). */
+  exports: { uri: string; created_at: string | null }[];
+  schedules: FirestoreSchedule[];
+  backups: FirestoreBackup[];
+  operations: FirestoreOperation[];
+};
+
+/** DynamoDB key attribute types: text, number, binary. */
+export type DynamoKeyType = "S" | "N" | "B";
+
+export type CloudBackup = {
+  table: string;
+  arn: string;
+  name: string;
+  status: string | null;
+  type: string | null;
+  size_bytes: number | null;
+  created_at: string | null;
+};
+
+/** A DynamoDB table's point-in-time recovery (status null + problem when AWS refused to say). */
+export type CloudPitr = {
+  table: string;
+  status: "ENABLED" | "DISABLED" | null;
+  earliest: string | null;
+  latest: string | null;
+  days: number | null;
+  problem: string | null;
+};
+
+export type CloudBackupsInfo = {
+  backups: CloudBackup[];
+  pitr: CloudPitr[];
+  cost: string;
+  pitr_cost: string;
+  restore: string;
+  restore_cost: string;
+};
+
+export type CloudRestoreBody = {
+  name: string;
+  backup_arn?: string;
+  table?: string;
+  point_in_time?: string;
+  latest?: boolean;
+  confirm_billing: boolean;
+};
+
+export type CloudDbResource = {
+  id: string;
+  kind: "instance" | "cluster";
+  engine: string;
+  deployer_engine: SqlExternalEngine | null;
+  status: string | null;
+  host: string | null;
+  port: number | null;
+  public: boolean;
+  database: string | null;
+  username: string | null;
+  /** Why Deployer can't connect to it; null when it can. */
+  problem: string | null;
+};
+
+export type CloudDbListing = {
+  region: string;
+  pc_ip: string | null;
+  databases: CloudDbResource[];
+  /** DynamoDB tables of the region (`tables_problem`: why they could not be listed). */
+  tables: string[];
+  tables_problem: string | null;
+  /** Firebase connections: the project's Firestore databases (`firestore_problem`: why they could not be listed). */
+  firestore?: FirestoreDatabase[];
+  firestore_problem?: string | null;
+  /** Firebase connections: the project's Realtime Databases (`rtdb_problem`: why they could not be listed). */
+  rtdb?: RtdbInstance[];
+  rtdb_problem?: string | null;
+};
+
+export type ApiKeyRole = "anon" | "service";
+
+export type ApiKey = {
+  id: string;
+  name: string;
+  prefix: string;
+  role: ApiKeyRole;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  /** False for keys created before Deployer kept secrets: they can't be revealed, only replaced. */
+  revealable: boolean;
+};
+
+/** A-024: live keys a removed or demoted admin created or revealed; they keep working until revoked. */
+export type KeysToRotate = { api_keys_to_rotate: ApiKey[] };
+
+/** V-06: `PATCH /instance/users/{id}` names, per project, the live keys a disabled account created or revealed. */
+export type ProjectKeysToRotate = {
+  project_id: string;
+  project_name: string;
+  keys: ApiKey[];
+};
+
+/** `GET /projects/{pid}/api-keys/{id}/config`: a ready-to-use client config (docs/DATA_API.md). */
+export type ApiKeyConfig = {
+  deployer: {
+    url: string;
+    project_id: string;
+    project: string;
+    role: ApiKeyRole;
+    api_key: string;
+    data_sources: {
+      id: string;
+      name: string;
+      kind: DataSourceKind;
+      engine: string;
+    }[];
+    endpoints: {
+      rows: string;
+      documents: string;
+      query: string;
+      schema: string;
+    };
+    generated_at: string;
+  };
+};
+
+// ---- Setup ----
+
+export type SetupStatus = {
+  initialized: boolean;
+  version: string;
+  public_url: string;
+  /** False while public_url is localhost: links built from it only open on this PC. */
+  reachable_elsewhere?: boolean;
+  providers: { google: boolean; github: boolean };
+  allow_signup: boolean;
+  /** docs/DEVICES.md: "host" when this installation is attached to another Deployer. */
+  device_mode?: "standalone" | "host";
+  /** False when this PC's CPU can't run MongoDB (no AVX). */
+  managed_mongodb?: boolean;
+};
+
+export type ImportSummary = {
+  users?: number;
+  projects?: number;
+  data_sources?: number;
+  rows?: number;
+  documents?: number;
+  /** e.g. views/triggers the export did not carry, or a device that was not connected. */
+  warnings?: string[];
+};
+
+export type SetupImportResponse = { ok: true; summary: ImportSummary };
+
+// ---- Auth ----
+
+export type ProvidersResponse = {
+  google: boolean;
+  github: boolean;
+  allow_signup: boolean;
+};
+
+// ---- Instance ----
+
+export type ProviderSettings = {
+  client_id: string | null;
+  secret_set: boolean;
+  configured: boolean;
+  callback_url: string;
+};
+
+export type InstanceSettings = {
+  public_url: string;
+  /** The dashboard on the Deployer PC itself, e.g. http://localhost:8080 (the installation's real port). */
+  local_url: string;
+  allow_signup: boolean;
+  /** On by default for new installs (off after an update if other users already existed): only the instance owner can create or import projects. */
+  owner_only_projects: boolean;
+  google: ProviderSettings;
+  github: ProviderSettings;
+  /** docs/MONITORING.md */
+  alert_webhook_url: string | null;
+  api_key_rate_limit: number;
+};
+
+/** Empty string clears a value. */
+export type InstanceSettingsUpdate = {
+  public_url?: string;
+  allow_signup?: boolean;
+  owner_only_projects?: boolean;
+  google_client_id?: string;
+  google_client_secret?: string;
+  github_client_id?: string;
+  github_client_secret?: string;
+  alert_webhook_url?: string;
+  api_key_rate_limit?: number;
+};
+
+/** GET /instance/projects: every project, with `my_role` null where the owner isn't a member. */
+export type InstanceProject = Omit<Project, "my_role"> & {
+  my_role: Role | null;
+  owner_email: string | null;
+  member_count: number;
+};
+
+// ---- Projects ----
+
+export type ProjectCreate = {
+  name: string;
+  description?: string;
+  /** `device_id` (DEVICES.md): where the managed databases are placed; null = main server. */
+  provision?: { sql: boolean; nosql: boolean; device_id?: string | null };
+};
+
+/** `result` of a finished `transfer.import` job (GET /transfers). */
+export type ImportJobResult = {
+  projects: { id: string; name: string }[];
+  summary: ImportSummary;
+};
+
+// ---- Invites ----
+
+export type InviteRole = Exclude<Role, "owner">;
+export type InviteCreate = {
+  email?: string;
+  role: InviteRole;
+  expires_in_days?: number;
+};
+/** reachable_elsewhere is false while the public URL is localhost: the link only opens on this PC. */
+export type InviteCreateResponse = {
+  invite: Invite;
+  invite_url: string;
+  reachable_elsewhere?: boolean;
+};
+export type InvitePreview = {
+  project_name: string;
+  role: Role;
+  invited_by_name: string | null;
+  email: string | null;
+  expires_at: string;
+};
+
+// ---- API keys ----
+
+export type ApiKeyCreateResponse = { api_key: ApiKey; secret: string };
+
+// ---- Data sources ----
+
+export type SqlExternalEngine = "mariadb" | "mysql" | "postgresql";
+
+export type DataSourceInput =
+  | {
+      kind: "sql";
+      mode: "managed";
+      engine: "mariadb";
+      name: string;
+      device_id?: string | null;
+    }
+  | {
+      kind: "nosql";
+      mode: "managed";
+      engine: "mongodb";
+      name: string;
+      device_id?: string | null;
+    }
+  | {
+      kind: "sql";
+      mode: "external";
+      engine: SqlExternalEngine;
+      name: string;
+      config: {
+        host: string;
+        port?: number;
+        username: string;
+        password: string;
+        database: string;
+        tls?: boolean;
+      };
+    }
+  | {
+      kind: "nosql";
+      mode: "external";
+      engine: "mongodb";
+      name: string;
+      config: { uri: string; database: string };
+    };
+
+export type ConnectionTestResult = {
+  ok: boolean;
+  message: string;
+  server_version: string | null;
+};
+
+export type ConnectionDetails = {
+  /** null for DynamoDB, which has no URI, user or password (apps use AWS credentials). */
+  uri: string | null;
+  host: string;
+  port: number | null;
+  username: string | null;
+  password: string | null;
+  database: string | null;
+  external_hint?: string | null;
+  /** DynamoDB (docs/CLOUD.md "C2-2"). */
+  region?: string | null;
+  tables?: string[];
+  /** Firestore ("C2-3") / Realtime Database ("C2-4"): the Google project; `database` is the database id. */
+  project_id?: string | null;
+};
+
+// ---- Schema ----
+
+export type ProjectSchema = {
+  sources: SourceSchema[];
+  links: SchemaLink[];
+  conventions: ConventionIssue[];
+  generated_at: string;
+};
+
+export type SourceSchema = {
+  source_id: string;
+  name: string;
+  kind: DataSourceKind;
+  engine: string;
+  status: "ok" | "error";
+  error: string | null;
+  entities: Entity[];
+  relationships: Relationship[];
+};
+
+export type JsonValue =
+  string | number | boolean | null | JsonValue[] | JsonObject;
+export type JsonObject = { [key: string]: JsonValue };
+
+export type EntityIndex = { name: string; fields: string[]; unique: boolean };
+
+export type Entity = {
+  name: string;
+  type: "table" | "collection";
+  row_count: number | null;
+  fields: Field[];
+  indexes: EntityIndex[];
+  validator: JsonObject | null; // Mongo $jsonSchema, if any
+};
+
+export type Field = {
+  name: string; // nested Mongo fields use dot paths: "address.city"
+  data_type: string;
+  nullable: boolean;
+  default: string | null;
+  primary_key: boolean;
+  unique: boolean;
+  indexed: boolean;
+  foreign_key: { entity: string; field: string } | null;
+  occurrence: number | null; // Mongo only: 0..1 share of sampled docs containing the field
+};
+
+export type RelationshipCardinality = "one_to_one" | "many_to_one";
+
+export type Relationship = {
+  from_entity: string;
+  from_fields: string[]; // the "many" / referencing side
+  to_entity: string;
+  to_fields: string[];
+  cardinality: RelationshipCardinality;
+  origin: "foreign_key" | "inferred";
+};
+
+export type LinkCardinality =
+  "one_to_one" | "one_to_many" | "many_to_one" | "many_to_many";
+
+export type SchemaLink = {
+  id: string;
+  from_source_id: string;
+  from_entity: string;
+  from_field: string;
+  to_source_id: string;
+  to_entity: string;
+  to_field: string;
+  cardinality: LinkCardinality;
+  note: string | null;
+  created_at: string;
+};
+
+export type SchemaLinkCreate = Omit<SchemaLink, "id" | "created_at">;
+
+export type ConventionIssue = {
+  rule: string; // e.g. "N1" - see docs/CONVENTIONS.md
+  severity: "warning" | "info";
+  source_id: string | null;
+  entity: string | null;
+  field: string | null;
+  message: string;
+};
+
+export type ForeignKeyAction = "cascade" | "set null" | "restrict";
+
+export type ColumnSpec = {
+  name: string;
+  type: string;
+  nullable?: boolean;
+  default?: string | null;
+  primary_key?: boolean;
+  unique?: boolean;
+  auto_increment?: boolean;
+  references?: { table: string; column: string; on_delete?: ForeignKeyAction };
+};
+
+export type TableSpec = {
+  name: string;
+  columns: ColumnSpec[];
+  timestamps?: boolean; // adds created_at / updated_at
+};
+
+export type SchemaExportFormat = "sql" | "mongo" | "bundle";
+
+// ---- Data browser ----
+
+export type RowsResponse = {
+  columns: string[];
+  primary_key: string[];
+  rows: JsonObject[];
+  total: number;
+};
+
+export type DocumentsResponse = {
+  documents: JsonObject[];
+  /** DynamoDB: the table's own estimate, null with a filter. */
+  total: number | null;
+  /** DynamoDB: the key attributes (partition, sort); a document's id is these as JSON. */
+  key?: string[];
+  /** DynamoDB: pass as `cursor` for the next page; null on the last one. */
+  next_cursor?: string | null;
+};
+
+export type Ok = { ok: true };
+/** Drops with a safety snapshot run as a job (202); without one they finish in the request. */
+export type DropResult = Ok & { job?: Job };
+
+export type ApiErrorBody = {
+  error: { code: string; message: string; details?: Record<string, unknown> };
+};
+
+// ---- Host devices (docs/DEVICES.md) ----
+// Shapes follow DEVICES.md (primary-side management API, data model and device-local API). Fields
+// that older API versions may omit are optional so the dashboard stays tolerant.
+
+export type DeviceRole = "database_host" | "backup_storage";
+export type DeviceSharingMode = "my_projects" | "selected";
+export type ManagedEngine = "mariadb" | "mongodb";
+
+export type EngineAvailability = Partial<Record<ManagedEngine, boolean>>;
+
+export type DeviceMetrics = {
+  cpu_percent?: number | null;
+  memory_used_bytes?: number | null;
+  memory_total_bytes?: number | null;
+  disk_free_bytes?: number | null;
+  disk_total_bytes?: number | null;
+  uptime_seconds?: number | null;
+  engines?: EngineAvailability;
+  version?: string | null;
+};
+
+export type DeviceCapabilities = {
+  engines?: EngineAvailability;
+  avx?: boolean;
+  [key: string]: unknown;
+};
+
+export type Device = {
+  id: string;
+  name: string;
+  owner_id: string;
+  owner_email?: string | null;
+  owner_name?: string | null;
+  status: "active" | "disabled";
+  roles: DeviceRole[];
+  sharing_mode: DeviceSharingMode;
+  /** Projects granted when `sharing_mode = "selected"`. */
+  project_ids?: string[];
+  hostname: string | null;
+  os: string | null;
+  version: string | null;
+  capabilities: DeviceCapabilities | null;
+  metrics: DeviceMetrics | null;
+  online?: boolean;
+  last_seen_at: string | null;
+  created_at: string;
+  hosted_sources_count?: number;
+};
+
+export type DeviceUpdate = {
+  name?: string;
+  roles?: DeviceRole[];
+  sharing_mode?: DeviceSharingMode;
+  project_ids?: string[];
+  status?: "active" | "disabled";
+};
+
+export type DeviceEnrollmentStatus =
+  "pending" | "approved" | "denied" | "expired" | "consumed";
+
+export type DeviceEnrollment = {
+  id: string;
+  user_code: string;
+  name: string;
+  hostname: string | null;
+  os: string | null;
+  version: string | null;
+  capabilities: DeviceCapabilities | null;
+  status: DeviceEnrollmentStatus;
+  expires_at: string;
+  created_at: string;
+};
+
+export type DeviceApproval = {
+  user_code: string;
+  name: string;
+  roles: DeviceRole[];
+  sharing_mode: DeviceSharingMode;
+  project_ids: string[];
+};
+
+export type PlacementOption = {
+  /** `null` = main server. */
+  device_id: string | null;
+  name: string;
+  online: boolean;
+  eligible: boolean;
+  reason?: string | null;
+  disk_free_bytes?: number | null;
+  engines?: EngineAvailability;
+  roles?: DeviceRole[];
+};
+
+// Device-local API (served by this installation when it is, or becomes, a host device).
+
+export type LocalHostedSource = {
+  database_name: string;
+  kind: DataSourceKind;
+  size_bytes: number | null;
+  last_backup_at?: string | null;
+};
+
+export type LocalDeviceStatus = {
+  mode: "standalone" | "host";
+  primary_url: string | null;
+  device_id: string | null;
+  device_name: string | null;
+  connected: boolean;
+  last_error: string | null;
+  /** The main Deployer refused this device (removed or disabled there): retrying cannot help. */
+  rejected: boolean;
+  last_connected_at: string | null;
+  hosted_sources: LocalHostedSource[];
+  metrics: DeviceMetrics | null;
+};
+
+export type EnrollStartResponse = {
+  user_code: string;
+  verification_url: string;
+  expires_in: number;
+};
+
+export type EnrollState =
+  "idle" | "pending" | "approved" | "denied" | "expired" | "error";
+
+/** While pending, the code fields are included so a refreshed page can show them again. */
+export type EnrollStatus = {
+  status: EnrollState;
+  message: string | null;
+} & Partial<EnrollStartResponse> & {
+    expires_at?: number;
+  };
+
+// ---- Jobs, backups & recovery (docs/BACKUPS.md) ----
+
+export type JobStatus =
+  "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export type Job = {
+  id: string;
+  type: string;
+  status: JobStatus;
+  progress: number;
+  message: string | null;
+  result: JsonObject | null;
+  error: string | null;
+  data_source_id: string | null;
+  device_id: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+};
+
+export type BackupSchedule = "hourly" | "every_6h" | "daily";
+
+export type BackupPolicy = {
+  enabled: boolean;
+  schedule: BackupSchedule;
+  keep_hourly: number;
+  keep_daily: number;
+  keep_weekly: number;
+  keep_monthly: number;
+  pitr_enabled: boolean;
+  pitr_window_days: number; // 1..35
+  copy_to_primary: boolean;
+  copy_to_device_id: string | null; // at most one copy target
+  safety_snapshots: boolean;
+  updated_at: string;
+};
+
+export type BackupPolicyUpdate = Partial<Omit<BackupPolicy, "updated_at">>;
+
+export type BackupTrigger =
+  | "scheduled"
+  | "manual"
+  | "pre_restore"
+  | "pre_drop"
+  | "pre_delete"
+  | "pre_move"
+  | "final";
+
+export type BackupCopyLocation = "local" | "device" | "primary";
+
+export type BackupCopy = {
+  location: BackupCopyLocation;
+  device_id: string | null;
+  status: string;
+};
+
+export type Backup = {
+  id: string;
+  trigger: BackupTrigger;
+  status: "running" | "succeeded" | "failed";
+  label: string | null;
+  pinned: boolean;
+  size_bytes: number | null;
+  started_at: string;
+  finished_at: string | null;
+  verified_at: string | null;
+  verify_status: "ok" | "failed" | null;
+  copies: BackupCopy[];
+  row_counts: Record<string, number> | null;
+  expires_at: string | null;
+  job_id: string | null;
+  /** Why the next prune keeps this version (server gfs_keep); null = it will be pruned. */
+  kept_as: KeptAs | null;
+};
+
+export type KeptAs =
+  | "pinned"
+  | "safety"
+  | "hourly"
+  | "daily"
+  | "weekly"
+  | "monthly"
+  | "latest"
+  | "running"
+  | "recent_failure";
+
+export type DiffChange = "added" | "removed" | "changed";
+
+export type FieldDiff = {
+  name: string;
+  change: DiffChange;
+  before: Field | null;
+  after: Field | null;
+};
+
+export type SchemaDiffEntity = {
+  name: string;
+  change: DiffChange;
+  fields: FieldDiff[];
+  indexes: { name: string; change: DiffChange }[];
+  validator_changed: boolean;
+  row_count: { before: number | null; after: number | null };
+};
+
+export type SchemaDiff = {
+  from: { backup_id: string | null; at: string };
+  to: { backup_id: string | null; at: string };
+  entities: SchemaDiffEntity[];
+};
+
+export type RecoveryWindow = {
+  pitr_enabled: boolean;
+  earliest: string | null;
+  latest: string | null;
+  snapshots: number;
+};
+
+export type RestoreMode = "new_source" | "in_place";
+
+export type RestoreRequest = {
+  backup_id?: string;
+  point_in_time?: string;
+  mode: RestoreMode;
+  new_name?: string;
+  device_id?: string | null;
+};
+
+export type JobResponse = { job: Job };
+
+export type DeletedSource = DataSource & {
+  deleted_at: string;
+  purge_at: string;
+};
+
+export type InstanceBackupSource = {
+  data_source_id: string;
+  project_id: string;
+  project_name: string;
+  name: string;
+  engine: string;
+  device_id: string | null;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  last_error: string | null;
+  pitr_latest: string | null;
+  /** The latest restore test (weekly; retried the next day after a failure). */
+  last_verified_at: string | null;
+  last_verify_status: "ok" | "failed" | null;
+  local_bytes: number | null;
+  copy_bytes: number | null;
+};
+
+export type InstanceBackups = {
+  sources: InstanceBackupSource[];
+  platform: {
+    last_success_at: string | null;
+    last_error: string | null;
+    latest_backup_id: string | null;
+  };
+  storage: {
+    location: string;
+    device_id: string | null;
+    used_bytes: number | null;
+    free_bytes: number | null;
+  }[];
+  /** The latest whole-instance export (Settings → Export & import); null when never. */
+  last_export_at: string | null;
+  /** A-195: final snapshots of deleted projects' databases, downloadable until `expires_at`. */
+  deleted_projects: DeletedProjectBackup[];
+  /** L-03: deleted projects' databases still on the host because their final snapshot or drop failed. */
+  unfinished_deletes: UnfinishedDelete[];
+};
+
+export type UnfinishedDelete = {
+  data_source_id: string;
+  project_id: string | null;
+  project_slug: string | null;
+  name: string | null;
+  engine: string;
+  error: string | null;
+  deleted_at: string;
+  last_attempt_at: string;
+  /** Retried every 6 hours; from this time the database is dropped without a final snapshot. */
+  drop_without_snapshot_at: string;
+};
+
+export type DeletedProjectBackup = {
+  backup_id: string;
+  project_id: string;
+  project_slug: string | null;
+  /** The project can be recreated with this database restored (POST .../deleted/projects/{id}/restore). */
+  restorable: boolean;
+  name: string;
+  engine: string;
+  size_bytes: number | null;
+  started_at: string;
+  expires_at: string | null;
+};
+
+// ---- Query console (docs/QUERY_CONSOLE.md) ----
+
+export type QueryRequest = {
+  /** SQL text (several statements allowed) or MongoDB shell code; 1..200 000 chars. */
+  query: string;
+  /** Rows returned per result set / documents printed; 1..5000, default 500. */
+  max_rows?: number;
+  /** Per statement (SQL) or for the whole script (MongoDB); 1..120, default 30. */
+  timeout_seconds?: number;
+  /** Which console layout sent it; recorded in the query log (QUERY_EDITOR.md). */
+  layout?: "terminal" | "editor";
+};
+
+export type QueryError = { code: string; message: string };
+
+export type SqlEngine = Exclude<DataSourceEngine, "mongodb">;
+
+/** One entry of `SqlQueryResponse.results`; `rows` values are encoded like the data browser. */
+export type SqlStatementResult =
+  | {
+      type: "rows";
+      statement: string;
+      columns: string[];
+      rows: JsonValue[][];
+      row_count: number;
+      truncated: boolean;
+      duration_ms: number;
+    }
+  | {
+      type: "count";
+      statement: string;
+      affected_rows: number;
+      duration_ms: number;
+    }
+  | { type: "empty"; statement: string; duration_ms: number }
+  | {
+      type: "error";
+      statement: string;
+      error: QueryError;
+      duration_ms?: number;
+    };
+
+export type SqlQueryResponse = {
+  kind: "sql";
+  engine: SqlEngine;
+  duration_ms: number;
+  results: SqlStatementResult[];
+  /** Id of the query-log row (QUERY_EDITOR.md). */
+  run_id?: string;
+};
+
+export type MongoQueryResponse = {
+  kind: "nosql";
+  /** `dynamodb`: one JSON request (QUERY_CONSOLE.md "DynamoDB"), answered in the same shape. */
+  engine: "mongodb" | "dynamodb" | "firestore" | "firebase_rtdb";
+  duration_ms: number;
+  /** Text printed by the shell (print(), warnings, stderr). */
+  output: string;
+  /** Relaxed Extended JSON of the last expression, or null. */
+  result: JsonValue | null;
+  /** Set when `result` is an array of documents (cursor batch). */
+  result_docs: JsonObject[] | null;
+  truncated: boolean;
+  error: QueryError | null;
+  /** Id of the query-log row (QUERY_EDITOR.md). */
+  run_id?: string;
+};
+
+export type QueryResponse = SqlQueryResponse | MongoQueryResponse;
+
+// ---- Query editor (docs/QUERY_EDITOR.md) ----
+
+export type SavedQueryKind = "sql" | "nosql" | "any";
+
+/** A snippet: `query_text` is opaque to the API (the notebook stores `{"cells":[…]}` JSON in it). */
+export type SavedQuery = {
+  id: string;
+  project_id: string;
+  data_source_id: string | null;
+  owner_id: string;
+  owner_email: string;
+  name: string;
+  folder: string | null;
+  query_text: string;
+  kind: SavedQueryKind;
+  created_at: string;
+  updated_at: string;
+  /** Bumped by every text change; a PATCH must carry the version it was based on (QUERY_EDITOR.md → phase 2). */
+  version: number;
+  updated_by_email: string;
+};
+
+/** A row of the (polled) snippet list: no `query_text`, fetch one snippet for that (A-123). */
+export type SavedQuerySummary = Omit<SavedQuery, "query_text">;
+
+export type SavedQueryInput = {
+  name: string;
+  folder?: string | null;
+  query_text: string;
+  data_source_id?: string | null;
+  kind: SavedQueryKind;
+};
+
+/** A PATCH always carries the version the client loaded; the API answers `409 version_conflict` otherwise. */
+export type SavedQueryUpdate = Partial<SavedQueryInput> & {
+  version: number;
+  message?: string;
+};
+
+export type SavedQueryVersion = {
+  id: string;
+  version: number;
+  author_id: string;
+  author_email: string;
+  message: string | null;
+  created_at: string;
+  /** Length of that version's `query_text`. */
+  chars: number;
+};
+
+export type SavedQueryRestore = {
+  version: number;
+  current_version: number;
+  message?: string;
+};
+
+export type QueryRunStatus = "ok" | "error" | "timeout" | "refused";
+
+/** One row of the server-side query log (every console run, both layouts). */
+export type QueryRun = {
+  id: string;
+  project_id: string;
+  data_source_id: string;
+  source_name: string;
+  kind: DataSourceKind;
+  engine: string;
+  user_id: string;
+  user_email: string;
+  /** Truncated to 2 000 chars in list responses (`query_truncated`); `GET /query-log/{id}` has the full text. */
+  query_text: string;
+  query_truncated?: boolean;
+  status: QueryRunStatus;
+  statements: number;
+  rows: number;
+  affected_rows: number | null;
+  duration_ms: number;
+  error_message: string | null;
+  read_only: boolean;
+  layout: "terminal" | "editor" | "api";
+  created_at: string;
+};
+
+export type QueryLogPage = { runs: QueryRun[]; has_more: boolean };
+
+export type QueryLogParams = {
+  source_id?: string;
+  user?: "me" | "all";
+  limit?: number;
+  before?: string;
+  before_id?: string;
+};
+
+// ---- Remote access (docs/REMOTE_ACCESS.md) ----
+
+export type Domain = {
+  id: string;
+  hostname: string;
+  zone_id: string;
+  zone_name: string;
+  /** The remote-access page lists only `dashboard` hostnames; app ones are in each app's settings. */
+  target_type: "dashboard" | "app" | "cloud_app";
+  project_id: string | null;
+  app_id: string | null;
+  status: "pending" | "active" | "error";
+  status_message: string | null;
+  url: string;
+  /** cloudflare (tunnel hostname) | aws | firebase (a cloud target's custom domain, docs/CLOUD.md). */
+  provider?: string;
+  /** docs/CLOUD.md "Custom domains": records the cloud target needs; `created` = made in Cloudflare. */
+  dns_records?: DnsRecord[];
+};
+
+export type DnsRecord = {
+  type: string;
+  name: string;
+  value: string;
+  created: boolean;
+  error: string | null;
+};
+
+export type RemoteAccessMode = "off" | "cloudflare" | "quick";
+
+export type RemoteAccess = {
+  mode: RemoteAccessMode;
+  public_url: string;
+  /** The dashboard on the Deployer PC itself, e.g. http://localhost:8080 (the installation's real port). */
+  local_url: string;
+  connector: {
+    running: boolean;
+    started_at: string | null;
+    last_error: string | null;
+  };
+  cloudflare: {
+    linked: boolean;
+    token_valid: boolean | null;
+    account: { id: string; name: string } | null;
+    tunnel: {
+      id: string;
+      name: string;
+      status: string | null;
+      connections: number;
+    } | null;
+    domains: Domain[];
+    /** Not in REMOTE_ACCESS.md; used when present so zones survive a page reload after linking. */
+    zones?: CloudflareZone[];
+  };
+  quick: { url: string | null };
+};
+
+export type CloudflareZone = {
+  id: string;
+  name: string;
+  account_id: string;
+  status: string;
+};
+
+export type CloudflareVerifyResult = {
+  ok: boolean;
+  accounts: { id: string; name: string }[];
+  zones: CloudflareZone[];
+  missing_permissions: string[];
+};
+
+export type PublicUrlRequest =
+  { domain_id: string } | { quick: true } | { local: true };
+
+export type PublicUrlResponse = {
+  settings: InstanceSettings;
+  oauth_callbacks: { google: string; github: string };
+  previous_public_url: string;
+  /** Automatic GitHub webhooks that could not follow the new URL. */
+  warnings?: string[];
+};
+
+// ---- Deployments / push-to-deploy (docs/DEPLOYMENTS.md) ----
+
+export type AppPreset = "static" | "node" | "python" | "dockerfile";
+
+export type DeploymentStatus =
+  | "queued"
+  | "building"
+  | "deploying"
+  | "live"
+  | "failed"
+  | "cancelled"
+  | "superseded";
+
+/** `github`: built and deployed by the app's GitHub Actions workflow, which reported the run (docs/CLOUD.md "C3"). */
+/** `env`: an App Runner / Cloud Run app's variables changed, so the live version was published again (docs/CLOUD.md "G1"). */
+export type DeploymentTrigger = "manual" | "webhook" | "rollback" | "github" | "env";
+
+export type Deployment = {
+  id: string;
+  app_id: string;
+  status: DeploymentStatus;
+  trigger: DeploymentTrigger;
+  commit_sha: string | null;
+  commit_message: string | null;
+  branch: string;
+  image_tag: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+  rollback_of: string | null;
+  /** Only with `?log=1`. */
+  log?: string;
+  job_id: string | null;
+  /** docs/CLOUD.md: the cloud URL this deployment went live on (null for `local`). */
+  target_url?: string | null;
+};
+
+// ---- Cloud hosting (docs/CLOUD.md) ----
+
+export type AppTarget =
+  "local" | "aws_static" | "aws_app" | "firebase_hosting" | "firebase_app";
+export type CloudProvider = "aws" | "firebase";
+
+export type CloudTarget = {
+  id: AppTarget;
+  label: string;
+  provider: CloudProvider | null;
+  kind: "any" | "static" | "app";
+  for: string;
+  when_pc_off: string;
+  cost: string;
+  uses_deployer_data: boolean;
+  /** Whether this project has a connection for it. */
+  available: boolean;
+};
+
+export type CloudConnection = {
+  id: string;
+  provider: CloudProvider;
+  name: string;
+  project_id: string | null;
+  status: "ok" | "error";
+  status_message: string | null;
+  account: {
+    account_id?: string | null;
+    region?: string | null;
+    role_arn?: string | null;
+    access_key_id_last4?: string;
+    project_id?: string | null;
+    client_email?: string | null;
+  };
+  apps_using?: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CloudConnectionInput = {
+  provider: CloudProvider;
+  name: string;
+  project_id?: string | null;
+  aws?: {
+    access_key_id: string;
+    secret_access_key: string;
+    region: string;
+    role_arn?: string | null;
+  };
+  firebase?: {
+    service_account_json: string;
+    project_id?: string | null;
+    region?: string | null;
+  };
+};
+
+export type CloudRequirements = {
+  /** `boundary`: the `deployer-boundary` permissions boundary Deployer puts on every role it creates (G3). */
+  /** `policies`: the IAM managed policies to create and attach to the deployer user, one per purpose. */
+  aws: { policies: { name: string; for: string; document: unknown }[]; boundary: unknown; boundary_name: string };
+  firebase: {
+    /** `on: "service_account"`: granted on the deployer service account itself, not the project. */
+    roles: {
+      role: string;
+      title: string;
+      why: string;
+      only_for?: string;
+      on?: string;
+    }[];
+    apis: { api: string; title: string; only_for?: string }[];
+  };
+};
+
+export type AppCloud = {
+  provider: CloudProvider | null;
+  connection_name: string | null;
+  url: string | null;
+  /** What Deployer created in the cloud account (removed on delete / target switch). */
+  resources: string[];
+  /** docs/CLOUD.md "G1": variables in the account's secret store (App Runner / Cloud Run only, else null). */
+  secrets: AppSecrets | null;
+};
+
+export type AppSecrets = {
+  enabled: boolean;
+  store: string | null;
+  note: string;
+  cost: string | null;
+  /** Names of the variables now in the store (never values). */
+  stored: string[];
+};
+
+export type AppBuild =
+  | { location: "pc" }
+  | {
+      location: "github";
+      status: "setting_up" | "ready" | "error";
+      message: string | null;
+      job_id: string | null;
+      repo: string | null;
+      workflow_path: string | null;
+      workflow_url: string | null;
+      runs_url: string | null;
+      /** Whether runs report back here (false while Deployer has no public address). */
+      reports: boolean | null;
+    };
+
+/** A run of the app's GitHub Actions workflow (from the GitHub API). */
+export type GitHubRun = {
+  id: number;
+  attempt: number | null;
+  status:
+    | "queued"
+    | "in_progress"
+    | "completed"
+    | "waiting"
+    | "requested"
+    | "pending";
+  conclusion: string | null;
+  event: string | null;
+  branch: string | null;
+  sha: string | null;
+  message: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  url: string | null;
+};
+
+/** `POST .../deploy` on an app that builds on GitHub Actions: the workflow was started there. */
+export type GitHubDispatch = {
+  github_actions: true;
+  status: "dispatched";
+  runs_url: string | null;
+};
+
+export type App = {
+  id: string;
+  project_id: string;
+  name: string;
+  slug: string;
+  repo_url: string;
+  branch: string;
+  root_dir: string;
+  preset: AppPreset;
+  install_command: string | null;
+  build_command: string | null;
+  start_command: string | null;
+  output_dir: string | null;
+  container_port: number | null;
+  env_keys: string[];
+  has_repo_token: boolean;
+  api_key_id: string | null;
+  /** docs/DEPLOYMENTS.md "Database access": joins the databases network + DEPLOYER_DB_* env. Admin-only to enable. */
+  database_access: boolean;
+  /** docs/CLOUD.md "C2-6": an App Runner app with database access also reaches the internet (a NAT gateway, billed). */
+  internet_access: boolean;
+  /** docs/COHOSTING.md "Websites on both PCs": also runs on the project's co-host PCs (admin-only). */
+  cohost: boolean;
+  /** Send the repository token to co-host PCs (readable by their owners); admin-only. */
+  cohost_share_repo_access: boolean;
+  replicas: AppReplica[];
+  /** Set when the app clones (and got its webhook) through someone's GitHub connection. */
+  github: { connected_by_email: string; hook_active: boolean } | null;
+  port: number;
+  /** null for cloud targets. */
+  local_url: string | null;
+  urls: string[];
+  /** docs/CLOUD.md: where it runs; `cloud` is null for `local`. */
+  target: AppTarget;
+  cloud_connection_id: string | null;
+  cloud: AppCloud | null;
+  /** docs/CLOUD.md "C3": where a cloud app builds (`pc` for every local app). */
+  build: AppBuild;
+  live_deployment: Deployment | null;
+  domains: Domain[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type AppInput = {
+  name: string;
+  repo_url: string;
+  branch?: string;
+  root_dir?: string;
+  preset: AppPreset;
+  install_command?: string | null;
+  build_command?: string | null;
+  start_command?: string | null;
+  output_dir?: string | null;
+  container_port?: number | null;
+  env?: Record<string, string>;
+  repo_token?: string;
+  api_key_id?: string | null;
+  database_access?: boolean;
+  cohost?: boolean;
+  cohost_share_repo_access?: boolean;
+  /** Clone + add the push webhook with the caller's GitHub connection (instead of `repo_token`). */
+  use_github_connection?: boolean;
+  /** docs/CLOUD.md (admin-only to change). */
+  target?: AppTarget;
+  cloud_connection_id?: string | null;
+  /** docs/CLOUD.md "G1": keep the variables in AWS Secrets Manager / Google Secret Manager (admin; `confirm_billing` to switch on). */
+  cloud_secrets?: boolean;
+  /** docs/CLOUD.md "C2-6": App Runner + database access only; turning it on needs `confirm_billing` (admin). */
+  internet_access?: boolean;
+  /** Required (true) when moving onto a cloud target or account, or turning on internet access: it is billed there. */
+  confirm_billing?: boolean;
+};
+
+/** `POST /apps` also returns what couldn't be set up automatically (e.g. the webhook). */
+export type AppCreated = App & { warnings: string[] };
+
+/** `repo_token: null` clears the stored token. */
+export type AppPatch = Partial<
+  Omit<AppInput, "repo_token" | "use_github_connection">
+> & { repo_token?: string | null };
+
+/** docs/DEPLOYMENTS.md "Connect a Git repository". */
+export type GitHubStatus = {
+  connected: boolean;
+  login: string | null;
+  scopes: string[];
+  configured: boolean;
+};
+
+export type GitHubRepo = {
+  full_name: string;
+  private: boolean;
+  default_branch: string;
+  html_url: string;
+  clone_url: string;
+  pushed_at: string | null;
+  description: string | null;
+};
+
+/** `POST /apps/detect`: a suggested app, never persisted. */
+export type AppDetectDraft = {
+  name: string;
+  repo_url: string;
+  branch: string;
+  root_dir: string;
+  preset: AppPreset;
+  install_command: string | null;
+  build_command: string | null;
+  start_command: string | null;
+  output_dir: string | null;
+  container_port: number | null;
+  env_keys: string[];
+  database_access_suggested: boolean;
+  detected: { what: string; from: string }[];
+  warnings: string[];
+  /** null when the repository isn't on GitHub (not inspected). */
+  private: boolean | null;
+};
+
+export type DeploymentPage = { deployments: Deployment[]; has_more: boolean };
+
+export type AppWebhook = {
+  url: string;
+  secret: string;
+  hook_active?: boolean;
+  warnings?: string[];
+};
+
+export type AppLogs = {
+  lines: string[];
+  container: string | null;
+  device_id?: string;
+};
+
+/** A co-hosted app's copy on a co-host PC (docs/COHOSTING.md "Websites on both PCs"). */
+export type AppReplica = {
+  device_id: string;
+  device_name: string | null;
+  online: boolean;
+  status: "pending" | "building" | "live" | "failed" | "stopped";
+  deployment_id: string | null;
+  error: string | null;
+  last_seen_at: string | null;
+};
+
+// ---- Co-hosting (docs/COHOSTING.md) ----
+
+export type ReplicaStatus = "copying" | "syncing" | "paused" | "error";
+
+export type Replica = {
+  id: string;
+  data_source_id: string;
+  device_id: string;
+  device_name: string | null;
+  /** Owner of the device = the co-host member. */
+  owner_id: string | null;
+  online: boolean;
+  status: ReplicaStatus;
+  lag_seconds: number | null;
+  last_synced_at: string | null;
+  error: string | null;
+  warnings: { table: string; message: string }[];
+  open_conflicts: number;
+  created_at: string;
+};
+
+export type ReplicaResponse = { replica: Replica; job?: Job };
+
+export type CohostEligibility = {
+  can_cohost: boolean;
+  /** The caller's own active database-host devices. */
+  devices: { id: string; name: string; online: boolean; granted: boolean }[];
+  offer: boolean;
+};
+
+export type SyncOp = "insert" | "update" | "delete";
+export type SyncSide = "primary" | "replica";
+export type ConflictChoice = SyncSide | "manual";
+
+export type ConflictField = {
+  name: string;
+  base: JsonValue;
+  primary: JsonValue;
+  replica: JsonValue;
+  changed_by: "both" | SyncSide;
+};
+
+export type SyncConflict = {
+  id: string;
+  replica_id: string;
+  table: string;
+  key: JsonObject;
+  status: "open" | "resolved";
+  /** `null` = deleted on that side (or, for `base`, unknown). */
+  base: JsonObject | null;
+  primary: JsonObject | null;
+  replica: JsonObject | null;
+  op_primary: SyncOp | null;
+  op_replica: SyncOp | null;
+  primary_changed_at: string | null;
+  replica_changed_at: string | null;
+  resolution: ConflictChoice | null;
+  resolved: JsonObject | null;
+  resolved_by_id: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+  fields: ConflictField[];
+  suggested: JsonObject | null;
+};
+
+export type SyncHistoryItem = {
+  type: "version" | "conflict";
+  id: string;
+  replica_id: string;
+  /** Versions: where the value came from. Conflicts: how they were resolved. */
+  origin: SyncSide | "resolution" | "restore" | "manual" | null;
+  value: JsonObject | null;
+  user_id: string | null;
+  at: string | null;
+  /** Conflicts only: the two sides before resolving. */
+  primary?: JsonObject | null;
+  replica?: JsonObject | null;
+};
+
+// ---- Monitoring (docs/MONITORING.md) ----
+
+export type MetricsWindow = "1h" | "6h" | "24h";
+
+export type HostMetrics = {
+  cpu_percent: number | null;
+  memory_used_bytes: number | null;
+  memory_total_bytes: number | null;
+  disk_free_bytes: number | null;
+  disk_total_bytes: number | null;
+  /** The disk the figures are for: the fuller of the Docker disk and the host drive. */
+  disk_label?: string | null;
+  uptime_seconds: number | null;
+  collected_at: string;
+};
+
+export type MetricsPoint = {
+  t: string;
+  cpu_percent: number | null;
+  memory_percent: number | null;
+  disk_free_bytes: number | null;
+  requests_per_min: number;
+  error_rate: number | null;
+  p95_ms: number | null;
+};
+
+export type RequestTotals = {
+  requests: number;
+  errors_5xx: number;
+  error_rate: number | null;
+  p95_ms: number | null;
+};
+
+export type ContainerStat = {
+  name: string;
+  service: string | null;
+  app_id: string | null;
+  status: string | null;
+  health: string | null;
+  restarts: number | null;
+  started_at: string | null;
+  cpu_percent: number | null;
+  memory_bytes: number | null;
+  memory_limit_bytes: number | null;
+};
+
+export type InstanceMetrics = {
+  window: MetricsWindow;
+  step_seconds: number;
+  current: HostMetrics | null;
+  points: MetricsPoint[];
+  requests: RequestTotals;
+  routes: (RequestTotals & { route: string })[];
+  containers: { collected_at: string; containers: ContainerStat[] } | null;
+};
+
+export type InstanceAlert = {
+  id: string;
+  alert: string;
+  severity: "warning" | "critical";
+  message: string;
+  first_seen: string | null;
+  last_seen: string | null;
+  opened_at: string | null;
+  dismissed: boolean;
+  snoozed_until: string | null;
+};
+
+export type MetricsSummary = {
+  current: HostMetrics | null;
+  requests_5m: RequestTotals;
+  containers: { total: number; running: number; problems: number } | null;
+  alerts: {
+    active: number;
+    visible: number;
+    critical: number;
+    top: InstanceAlert | null;
+  };
+};

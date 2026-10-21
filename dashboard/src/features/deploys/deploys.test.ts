@@ -1,0 +1,343 @@
+import { describe, expect, it } from "vitest";
+import type { App, AppDetectDraft, GitHubRepo } from "../../api/types";
+import {
+  canRollback,
+  cohostSummary,
+  databaseEnvNames,
+  deploymentDuration,
+  DEPLOYMENT_STATUS,
+  detectedSummary,
+  draftErrors,
+  draftFromDetect,
+  draftToInput,
+  draftToPatch,
+  emptyDraft,
+  filterRepos,
+  isActive,
+  movesToCloud,
+  parseEnv,
+  reachableSources,
+  rowsToEnv,
+  seedEnv,
+  shortSha,
+  recommendedTarget,
+  slugify,
+  targetFits,
+  unfilledKeys,
+} from "./deploys";
+
+describe("slugify", () => {
+  it("lowercases and replaces runs of other characters with one dash", () => {
+    expect(slugify("My Shop  App!")).toBe("my-shop-app");
+    expect(slugify("Hello_World.v2")).toBe("hello-world-v2");
+  });
+  it("strips leading/trailing dashes and caps at 63 chars", () => {
+    expect(slugify("--shop--")).toBe("shop");
+    expect(slugify("a".repeat(62) + "-b")).toBe("a".repeat(62));
+    expect(slugify("x".repeat(80)).length).toBe(63);
+  });
+  it("is empty when nothing DNS-safe remains", () => {
+    expect(slugify("!!!")).toBe("");
+  });
+});
+
+describe("parseEnv", () => {
+  it("handles comments, blank lines, export, CRLF and quotes", () => {
+    const text = [
+      "# comment",
+      "",
+      "export API_URL=https://example.com",
+      'GREETING="hello world" # trailing',
+      "SINGLE='a b'",
+      "PLAIN=value # comment",
+      'MULTI="a\\nb"',
+      "bad line",
+      "=novalue",
+      "EMPTY=",
+    ].join("\r\n");
+    expect(parseEnv(text)).toEqual([
+      { key: "API_URL", value: "https://example.com" },
+      { key: "GREETING", value: "hello world" },
+      { key: "SINGLE", value: "a b" },
+      { key: "PLAIN", value: "value" },
+      { key: "MULTI", value: "a\nb" },
+      { key: "EMPTY", value: "" },
+    ]);
+  });
+  it("keeps '=' inside values", () => {
+    // No user:password@ in the URL: the repository's secret scanner would flag even a fake one.
+    expect(parseEnv("DSN=postgres://db.example.test/app?sslmode=require&x=1")).toEqual([
+      { key: "DSN", value: "postgres://db.example.test/app?sslmode=require&x=1" },
+    ]);
+  });
+  it("rowsToEnv drops blank keys and lets later duplicates win", () => {
+    expect(
+      rowsToEnv([
+        { key: " A ", value: "1" },
+        { key: "", value: "x" },
+        { key: "A", value: "2" },
+      ]),
+    ).toEqual({ A: "2" });
+  });
+});
+
+describe("deployment status helpers", () => {
+  it("maps every status to a label and tone", () => {
+    expect(DEPLOYMENT_STATUS.live).toEqual({ label: "Live", tone: "success" });
+    expect(DEPLOYMENT_STATUS.failed.tone).toBe("danger");
+    expect(DEPLOYMENT_STATUS.building.tone).toBe("info");
+  });
+  it("isActive only for queued/building/deploying", () => {
+    expect(["queued", "building", "deploying"].every(isActive)).toBe(true);
+    expect(["live", "failed", "cancelled", "superseded", undefined].some(isActive)).toBe(false);
+  });
+  it("deploymentDuration uses finished_at, or now while active", () => {
+    const started_at = "2026-01-01T00:00:00Z";
+    expect(deploymentDuration({ status: "live", started_at, finished_at: "2026-01-01T00:01:30Z" })).toBe(90);
+    expect(
+      deploymentDuration({ status: "building", started_at, finished_at: null }, Date.parse("2026-01-01T00:00:10Z")),
+    ).toBe(10);
+    expect(deploymentDuration({ status: "queued", started_at: null, finished_at: null })).toBeNull();
+    expect(deploymentDuration({ status: "cancelled", started_at, finished_at: null })).toBeNull();
+  });
+  it("canRollback needs a superseded deployment with an image", () => {
+    expect(canRollback({ status: "superseded", image_tag: "deployer-app/x:y" })).toBe(true);
+    expect(canRollback({ status: "live", image_tag: "deployer-app/x:y" })).toBe(false);
+    expect(canRollback({ status: "superseded", image_tag: null })).toBe(false);
+  });
+  it("shortSha", () => {
+    expect(shortSha("0123456789abcdef")).toBe("0123456");
+    expect(shortSha(null)).toBe("—");
+  });
+});
+
+describe("app draft", () => {
+  it("validates required fields per preset", () => {
+    const d = { ...emptyDraft(), name: "Shop", repo_url: "https://github.com/me/shop" };
+    expect(draftErrors(d)).toEqual({});
+    expect(draftErrors({ ...d, repo_url: "git@github.com:me/shop.git" }).repo_url).toBeTruthy();
+    expect(draftErrors({ ...d, preset: "python" }).start_command).toBeTruthy();
+    expect(draftErrors({ ...d, preset: "dockerfile", container_port: "70000" }).container_port).toBeTruthy();
+    expect(draftErrors({ ...d, preset: "dockerfile", container_port: "8080" })).toEqual({});
+  });
+  it("only sends the fields of the chosen preset and the token when private", () => {
+    const d = {
+      ...emptyDraft(),
+      name: " Shop ",
+      repo_url: "https://github.com/me/shop",
+      preset: "node" as const,
+      start_command: "node server.js",
+      output_dir: "dist",
+      private_repo: true,
+      repo_token: "ghp_x",
+    };
+    const body = draftToInput(d, [{ key: "A", value: "1" }]);
+    expect(body).toMatchObject({
+      name: "Shop",
+      branch: "main",
+      root_dir: ".",
+      start_command: "node server.js",
+      output_dir: null,
+      container_port: null,
+      env: { A: "1" },
+      api_key_id: null,
+      repo_token: "ghp_x",
+    });
+    expect(draftToInput({ ...d, private_repo: false }, []).repo_token).toBeUndefined();
+  });
+  it("patch clears the token when the private toggle is switched off", () => {
+    const app = { has_repo_token: true } as App;
+    const d = { ...emptyDraft(), name: "Shop", repo_url: "https://x", private_repo: false };
+    const patch = draftToPatch(d, app);
+    expect(patch.repo_token).toBeNull();
+    expect("env" in patch).toBe(false);
+    expect(draftToPatch({ ...d, private_repo: true }, app).repo_token).toBeUndefined();
+  });
+  it("internet access (NAT gateway) counts on App Runner with database access and needs its own billing tick", () => {
+    const base = { ...emptyDraft(), name: "Api", repo_url: "https://github.com/me/api", preset: "node" as const };
+    const cloud = { target: "aws_app" as const, cloud_connection_id: "c1", saved_target: "aws_app" as const, saved_connection_id: "c1" };
+    const d = { ...base, ...cloud, database_access: true, internet_access: true };
+    expect(draftErrors(d).internet_access).toBeTruthy();
+    expect(draftErrors({ ...d, confirm_internet: true })).toEqual({});
+    expect(draftToInput({ ...d, confirm_internet: true }, [])).toMatchObject({ internet_access: true, confirm_billing: true });
+    // Already on: no confirmation again; off, or without database access, nothing is sent as on.
+    expect(draftErrors({ ...d, saved_internet_access: true })).toEqual({});
+    expect("confirm_billing" in draftToInput({ ...d, saved_internet_access: true }, [])).toBe(false);
+    expect(draftToInput({ ...d, database_access: false, confirm_internet: true }, []).internet_access).toBe(false);
+    // Moving onto a cloud target with it on: both ticks are needed for the one confirmation.
+    const moving = { ...d, saved_target: "local" as const, saved_connection_id: "", confirm_internet: true };
+    expect(draftErrors(moving).target).toBeTruthy();
+    expect(draftToInput(moving, []).confirm_billing).toBe(false);
+    expect(draftToInput({ ...moving, confirm_billing: true }, []).confirm_billing).toBe(true);
+  });
+});
+
+describe("database access", () => {
+  it("names variables like the worker (upper-case, non-alphanumerics to _)", () => {
+    expect(databaseEnvNames({ name: "shop-db", kind: "sql" })).toEqual([
+      "DEPLOYER_DB_SHOP_DB_HOST",
+      "DEPLOYER_DB_SHOP_DB_PORT",
+      "DEPLOYER_DB_SHOP_DB_USER",
+      "DEPLOYER_DB_SHOP_DB_PASSWORD",
+      "DEPLOYER_DB_SHOP_DB_DATABASE",
+      "DEPLOYER_DB_SHOP_DB_URL",
+    ]);
+    expect(databaseEnvNames({ name: "Orders", kind: "sql", engine: "mysql", cloud: { service: "rds" } }).at(-1)).toBe(
+      "DEPLOYER_DB_ORDERS_SSL_CA_URL",
+    );
+    expect(databaseEnvNames({ name: "Docs Store", kind: "nosql" })).toEqual(["DEPLOYER_DB_DOCS_STORE_URL", "DEPLOYER_DB_DOCS_STORE_DATABASE"]);
+    expect(databaseEnvNames({ name: "Events", kind: "nosql", engine: "dynamodb" })).toEqual([
+      "DEPLOYER_DB_EVENTS_TABLE",
+      "DEPLOYER_DB_EVENTS_TABLES",
+      "DEPLOYER_DB_EVENTS_REGION",
+      "DEPLOYER_DB_EVENTS_DATABASE",
+    ]);
+    expect(databaseEnvNames({ name: "App data", kind: "nosql", engine: "firestore" })).toEqual([
+      "DEPLOYER_DB_APP_DATA_PROJECT",
+      "DEPLOYER_DB_APP_DATA_DATABASE",
+    ]);
+    expect(databaseEnvNames({ name: "Live", kind: "nosql", engine: "firebase_rtdb" })).toEqual([
+      "DEPLOYER_DB_LIVE_PROJECT",
+      "DEPLOYER_DB_LIVE_URL",
+      "DEPLOYER_DB_LIVE_DATABASE",
+    ]);
+  });
+  it("only managed sources on the main server are reachable", () => {
+    const rows = [
+      { id: "a", mode: "managed" as const, device_id: null },
+      { id: "b", mode: "managed" as const, device_id: "dev" },
+      { id: "c", mode: "external" as const, device_id: null },
+    ];
+    expect(reachableSources(rows).map((r) => r.id)).toEqual(["a"]);
+  });
+  it("draft carries the flag", () => {
+    const d = { ...emptyDraft({ database_access: true } as App), name: "Shop", repo_url: "https://x" };
+    expect(draftToInput(d, []).database_access).toBe(true);
+    expect(draftToPatch({ ...d, database_access: false }, { has_repo_token: false } as App).database_access).toBe(false);
+  });
+});
+
+describe("connect a Git repository", () => {
+  const repo = (full_name: string, pushed_at: string | null, description: string | null = null): GitHubRepo => ({
+    full_name,
+    pushed_at,
+    description,
+    private: false,
+    default_branch: "main",
+    html_url: `https://github.com/${full_name}`,
+    clone_url: `https://github.com/${full_name}.git`,
+  });
+  const hawkerhub: AppDetectDraft = {
+    name: "HawkerHub",
+    repo_url: "https://github.com/nyx-ulrix/HawkerHub",
+    branch: "main",
+    root_dir: ".",
+    preset: "python",
+    install_command: null,
+    build_command: null,
+    start_command: "python -m flask --app app run --host 0.0.0.0 --port 8000",
+    output_dir: null,
+    container_port: null,
+    env_keys: ["HH_SQL_HOST", "HH_SQL_PASSWORD"],
+    database_access_suggested: true,
+    detected: [{ what: "Flask app", from: "requirements.txt, app/__init__.py" }],
+    warnings: [],
+    private: true,
+  };
+
+  it("filters repositories by name or description and sorts by last push", () => {
+    const repos = [repo("a/old", "2026-01-01T00:00:00Z"), repo("b/new", "2026-09-01T00:00:00Z", "Hawker finder"), repo("c/none", null)];
+    expect(filterRepos(repos, "").map((r) => r.full_name)).toEqual(["b/new", "a/old", "c/none"]);
+    expect(filterRepos(repos, " HAWKER ").map((r) => r.full_name)).toEqual(["b/new"]);
+    expect(filterRepos(repos, "a/").map((r) => r.full_name)).toEqual(["a/old"]);
+  });
+
+  it("maps a detected draft onto the form (connection vs pasted private URL)", () => {
+    const viaConnection = draftFromDetect(hawkerhub, true, true);
+    expect(viaConnection).toMatchObject({
+      name: "HawkerHub",
+      preset: "python",
+      start_command: hawkerhub.start_command,
+      install_command: "",
+      use_github_connection: true,
+      private_repo: false,
+      database_access: true,
+    });
+    const body = draftToInput(viaConnection, []);
+    expect(body.use_github_connection).toBe(true);
+    expect(body.repo_token).toBeUndefined();
+    expect(body.install_command).toBeNull();
+    // Pasted private URL without a connection: the token path; developers can't switch database access on.
+    expect(draftFromDetect(hawkerhub, false, false)).toMatchObject({ use_github_connection: false, private_repo: true, database_access: false });
+    expect(draftFromDetect({ ...hawkerhub, container_port: 5000, preset: "dockerfile" }, false, true).container_port).toBe("5000");
+    expect("use_github_connection" in draftToPatch(viaConnection, { has_repo_token: false } as App)).toBe(false);
+  });
+
+  it("seeds env keys with empty values, keeping typed ones, and reports the unfilled ones", () => {
+    const rows = seedEnv(["A", "B"], [{ key: "B", value: "typed" }]);
+    expect(rows).toEqual([
+      { key: "B", value: "typed" },
+      { key: "A", value: "" },
+    ]);
+    expect(unfilledKeys(["A", "B"], rows)).toEqual(["A"]);
+    expect(unfilledKeys(["A"], [{ key: "A", value: " x " }])).toEqual([]);
+  });
+
+  it("summarises what was detected", () => {
+    expect(detectedSummary(hawkerhub)).toBe("Flask app (requirements.txt, app/__init__.py)");
+    expect(detectedSummary({ detected: [] })).toBeNull();
+  });
+});
+
+describe("cohostSummary", () => {
+  it("counts live copies of co-hosted apps only", () => {
+    const r = (status: string) => ({ status }) as App["replicas"][number];
+    expect(cohostSummary({ cohost: true, replicas: [r("live"), r("failed"), r("live")] })).toBe("Also running on 2 co-host PCs");
+    expect(cohostSummary({ cohost: true, replicas: [r("live")] })).toBe("Also running on 1 co-host PC");
+    expect(cohostSummary({ cohost: true, replicas: [r("pending")] })).toBeNull();
+    expect(cohostSummary({ cohost: false, replicas: [r("live")] })).toBeNull();
+  });
+});
+
+describe("cloud targets (docs/CLOUD.md)", () => {
+  const all = (["local", "aws_static", "aws_app", "firebase_hosting", "firebase_app"] as const).map((id) => ({ id, available: true }));
+
+  it("static targets need the static preset", () => {
+    expect(targetFits("aws_static", "static")).toBe(true);
+    expect(targetFits("firebase_hosting", "node")).toBe(false);
+    expect(targetFits("aws_app", "python")).toBe(true);
+    expect(targetFits("local", "dockerfile")).toBe(true);
+  });
+
+  it("recommends a CDN for static sites and a container service for servers, among connected accounts", () => {
+    expect(recommendedTarget("static", all)).toBe("firebase_hosting");
+    expect(recommendedTarget("node", all)).toBe("aws_app");
+    const awsOnly = all.map((t) => ({ ...t, available: !t.id.startsWith("firebase") }));
+    expect(recommendedTarget("static", awsOnly)).toBe("aws_static");
+    expect(recommendedTarget("python", all.map((t) => ({ ...t, available: t.id === "local" })))).toBe("local");
+  });
+
+  it("cloud apps never send this PC's API key or database access, and need an account", () => {
+    const d = { ...emptyDraft(), name: "Site", repo_url: "https://github.com/a/b", target: "aws_static" as const };
+    expect(draftErrors(d).target).toMatch(/cloud account/);
+    const unticked = { ...d, cloud_connection_id: "c1", api_key_id: "k1", database_access: true };
+    expect(draftErrors(unticked).target).toMatch(/Tick the box/); // billed to that account: confirmed first
+    const ready = { ...unticked, confirm_billing: true };
+    expect(draftErrors(ready).target).toBeUndefined();
+    const body = draftToInput(ready, []);
+    expect(body).toMatchObject({ target: "aws_static", cloud_connection_id: "c1", api_key_id: null, database_access: false });
+    expect(body.confirm_billing).toBe(true);
+    // An app already on that target and account is not asked again; a local app sends no confirmation.
+    const saved = { ...unticked, saved_target: "aws_static" as const, saved_connection_id: "c1" };
+    expect(movesToCloud(saved)).toBe(false);
+    expect(draftErrors(saved).target).toBeUndefined();
+    expect(draftToInput(saved, []).confirm_billing).toBeUndefined();
+    expect(movesToCloud({ ...saved, cloud_connection_id: "c2" })).toBe(true);
+    // App Runner keeps database access: it means the project's AWS databases (docs/CLOUD.md "C2").
+    expect(draftToInput({ ...ready, target: "aws_app" }, [])).toMatchObject({ database_access: true, api_key_id: null });
+    expect(draftToInput({ ...ready, target: "firebase_app" }, [])).toMatchObject({ database_access: true });
+    expect(draftToInput({ ...ready, target: "firebase_hosting" }, [])).toMatchObject({ database_access: false });
+    expect(draftErrors({ ...ready, preset: "node" }).target).toMatch(/static files/);
+    expect(draftToInput({ ...ready, target: "local" }, []).cloud_connection_id).toBeNull();
+  });
+});

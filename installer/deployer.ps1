@@ -1,0 +1,915 @@
+<#
+.SYNOPSIS
+    Deployer management CLI.
+
+.DESCRIPTION
+    deployer status                 Runtime, containers and health
+    deployer start                  Start the stack (and the WSL engine if needed)
+    deployer stop                   Stop the stack
+    deployer restart [service]      Restart everything or one service
+    deployer logs [service] [-Follow] [-Tail 200]
+    deployer update [-Ref v0.2.0] [-FromSource]
+                                    Download new deploy files (keeps .env), pull images, restart
+    deployer backup                 MariaDB + MongoDB dumps and .env into backups\<timestamp>
+    deployer restore <folder> [-Yes] [-Force]
+                                    Load a backup folder (or its backups\<timestamp> name) back in
+    deployer open                   Open the dashboard in your browser
+    deployer config                 Show non-secret settings
+    deployer compose -- <args>      Run any docker compose command against the stack
+    deployer uninstall [-KeepData] [-Yes]
+
+    Settings (used by Deployer Control; need administrator rights):
+    deployer set-port <port>        Change the local port (restarts the web front door)
+    deployer lan on|off             Allow / block other devices on your private network
+    deployer autostart on|off       Start Deployer (and the tray icon) when you sign in
+    deployer keepawake on|off       Keep this PC awake while plugged in
+    deployer status -Json           Machine-readable status (one "##deployer:status {json}" line)
+
+    Host devices (see docs/DEVICES.md):
+    deployer device status          Link to a main Deployer, connection state, hosted databases (JSON)
+    deployer device detach [-Force] [-Yes]
+                                    Forget the main Deployer on this PC (asks for confirmation)
+
+    Sign-in apps (Google / GitHub OAuth; no administrator rights needed):
+    deployer oauth status [-Json]   Client IDs, whether a secret is set, and the callback URLs to register
+    deployer oauth set google|github
+                                    Store a Client ID and secret: read from DEPLOYER_OAUTH_CLIENT_ID /
+                                    DEPLOYER_OAUTH_CLIENT_SECRET, else asked for (an empty secret keeps the stored one)
+    deployer oauth clear google|github
+
+    Account recovery (no administrator rights needed):
+    deployer reset-password [email] Set a new password for a Deployer account (default: the owner) and sign it
+                                    out everywhere. Read from DEPLOYER_NEW_PASSWORD, else asked for twice
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [string]$Command = 'help',
+    [Parameter(Position = 1)]
+    [string]$Service = '',
+    [switch]$Follow,
+    [int]$Tail = 200,
+    [string]$Ref = '',
+    [switch]$FromSource,
+    [switch]$KeepData,
+    [switch]$Yes,
+    [switch]$Background,
+    [switch]$Json,
+    [switch]$Force,
+    [string]$InstallDir = '',
+    # Set by Assert-Admin on the copy it starts in a new administrator window (A-142).
+    [switch]$Elevated,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Rest = @()
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+. (Join-Path $PSScriptRoot 'lib\common.ps1')
+
+if (-not $InstallDir) {
+    $parent = Split-Path -Parent $PSScriptRoot
+    if (Test-Path -LiteralPath (Join-Path $parent 'docker-compose.yml')) {
+        $InstallDir = $parent
+    } elseif ($env:DEPLOYER_HOME) {
+        $InstallDir = $env:DEPLOYER_HOME
+    } else {
+        $InstallDir = Join-Path $env:ProgramData 'Deployer'
+    }
+}
+$InstallDir = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+$DeployerLogPath = Join-Path $InstallDir 'logs\deployer.log'
+if ($Elevated -and (Test-Path -LiteralPath (Join-Path $InstallDir 'runtime.json'))) {
+    # The administrator window closes when done; keep a record the parent window can point to.
+    New-Item -ItemType Directory -Path (Split-Path -Parent $DeployerLogPath) -Force | Out-Null
+    $script:DeployerLogFile = $DeployerLogPath
+}
+
+function Show-Help {
+    Write-Host ''
+    Write-Host 'Deployer management CLI' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  deployer status                      Runtime, containers and health'
+    Write-Host '  deployer start | stop                Start or stop the stack'
+    Write-Host '  deployer restart [service]           Restart everything or one service (api, dashboard, caddy, ...)'
+    Write-Host '  deployer logs [service] [-Follow]    Show logs (-Tail N lines, default 200)'
+    Write-Host '  deployer update [-Ref <tag>]         Update deploy files and images; .env and data are kept'
+    Write-Host '  deployer backup                      Dump MariaDB/MongoDB and copy .env to backups\<timestamp>'
+    Write-Host '  deployer restore <folder>            Load a backup back in (replaces the current databases; asks first)'
+    Write-Host '  deployer open                        Open the dashboard'
+    Write-Host '  deployer config                      Show non-secret settings'
+    Write-Host '  deployer compose -- <args>           Run docker compose (e.g. deployer compose -- ps -a)'
+    Write-Host '  deployer uninstall [-KeepData]       Remove Deployer (asks for confirmation)'
+    Write-Host ''
+    Write-Host '  deployer set-port <port>             Change the local port'
+    Write-Host '  deployer lan on|off                  Allow or block other devices on your private network'
+    Write-Host '  deployer autostart on|off            Start Deployer when you sign in'
+    Write-Host '  deployer keepawake on|off            Keep this PC awake while plugged in'
+    Write-Host '  deployer status -Json                Machine-readable status'
+    Write-Host ''
+    Write-Host '  deployer device status               Host device link, connection and hosted databases'
+    Write-Host '  deployer device detach [-Force]      Forget the main Deployer on this PC (asks first)'
+    Write-Host ''
+    Write-Host '  deployer oauth status [-Json]        Google/GitHub sign-in apps and their callback URLs'
+    Write-Host '  deployer oauth set google|github     Save a Client ID and secret (asks, or reads DEPLOYER_OAUTH_CLIENT_ID/_SECRET)'
+    Write-Host '  deployer oauth clear google|github   Remove a sign-in app'
+    Write-Host ''
+    Write-Host '  deployer reset-password [email]      Forgot your password? Set a new one (default: the owner account)'
+    Write-Host ''
+    Write-Host "  Install directory: $InstallDir"
+    Write-Host ''
+}
+
+function Get-Context {
+    $state = Read-DeployerState -InstallDir $InstallDir
+    if ($null -eq $state) {
+        throw "Deployer is not installed in $InstallDir (runtime.json missing). Run the installer first, or pass -InstallDir."
+    }
+    $envValues = Read-DeployerEnvFile -Path (Join-Path $InstallDir '.env')
+    $port = 8080
+    if ($envValues['DEPLOYER_HTTP_PORT'] -match '^\d+$') { $port = [int]$envValues['DEPLOYER_HTTP_PORT'] }
+    elseif ((Get-DeployerStateValue $state 'port') -as [int]) { $port = [int](Get-DeployerStateValue $state 'port') }
+    return [pscustomobject]@{
+        State   = $state
+        Runtime = [string](Get-DeployerStateValue $state 'runtime' 'existing')
+        Port    = $port
+        Env     = $envValues
+        Lan     = (Get-DeployerStateValue $state 'lan')
+    }
+}
+
+function Assert-Admin {
+    param([string]$Why)
+    if (Test-DeployerIsAdmin) { return $true }
+    Write-DeployerInfo "Administrator rights are needed to $Why. Asking Windows..."
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, $Command)
+    if ($Service) { $argList += $Service }
+    $argList += @('-InstallDir', $InstallDir, '-Elevated')
+    if ($KeepData) { $argList += '-KeepData' }
+    if ($Yes) { $argList += '-Yes' }
+    if ($Ref) { $argList += @('-Ref', $Ref) }
+    if ($FromSource) { $argList += '-FromSource' }
+    $quoted = ($argList | ForEach-Object { ConvertTo-DeployerArgument $_ }) -join ' '
+    $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $quoted -Verb RunAs -PassThru -Wait
+    # The administrator window is gone by now; say here how it ended.
+    if ($p.ExitCode -eq 0) { Write-DeployerOk 'Done (in the administrator window).' }
+    else { Write-DeployerError "Failed (exit $($p.ExitCode)), see $DeployerLogPath" }
+    exit $p.ExitCode
+}
+
+function Initialize-Engine {
+    param($Ctx, [int]$TimeoutSeconds = 300)
+    if (Test-DeployerDockerEngine -Runtime $Ctx.Runtime) { return }
+    switch ($Ctx.Runtime) {
+        'wsl-engine' { $msg = 'Starting the Docker Engine in WSL' }
+        'docker-desktop' { $msg = 'Starting Docker Desktop' }
+        default { $msg = if (Get-DeployerDockerDesktopExe) { 'Starting Docker Desktop' } else { 'Waiting for Docker' } }
+    }
+    if (-not (Wait-DeployerDockerEngine -Runtime $Ctx.Runtime -TimeoutSeconds $TimeoutSeconds -WaitingMessage $msg)) {
+        if ($script:DeployerDockerNeedsWindowsRestart) {
+            throw "Docker Desktop cannot start until Windows is restarted (a Windows issue with Docker's socket files after sleep). Restart Windows, then run 'deployer start'. To stop it recurring, move to the free Docker Engine (WSL2), which does not use Docker Desktop: export everything (dashboard Settings -> Export & import), uninstall, install again choosing 'Free Docker Engine', then choose 'Restore from export'."
+        }
+        throw "The Docker engine ($($Ctx.Runtime)) is not reachable. For Docker Desktop, open it and wait until it says 'Engine running'."
+    }
+}
+
+function Update-LanForwarding {
+    param($Ctx)
+    if ($null -eq $Ctx.Lan) { return }
+    if (-not (Get-DeployerStateValue $Ctx.Lan 'enabled' $false)) { return }
+    # WSL always uses the port forward (a stale 'mirrored' mode from older versions included).
+    if ($Ctx.Runtime -eq 'wsl-engine') {
+        if (Update-DeployerPortProxy -Port $Ctx.Port) { Write-DeployerOk 'LAN port forwarding refreshed' }
+    }
+}
+
+function Start-Stack {
+    # compose up, LAN forwarding and the health wait; returns the health. Throws when the stack did not
+    # come up, so the sign-in task's loop tries again.
+    param($Ctx)
+    # The keep-alive first: with nothing holding the distro, WSL stops it seconds after `compose up`
+    # returns when the site takes a while to answer (seen right after sign-in).
+    if ($Ctx.Runtime -eq 'wsl-engine') { Start-DeployerKeepAlive }
+    $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $Ctx.Runtime -Arguments @('up', '-d', '--remove-orphans')
+    if ($code -ne 0) { throw "docker compose up failed (exit code $code)." }
+    # The WSL IP changes when the VM restarts (sleep/hibernate); LAN rules must follow it.
+    try { Update-LanForwarding -Ctx $Ctx } catch { Write-DeployerWarn "LAN forwarding not refreshed: $($_.Exception.Message)" }
+    $health = Wait-DeployerHealth -Port $Ctx.Port -TimeoutSeconds $(if ($Background) { 240 } else { 180 })
+    if (-not $health) {
+        # A container the engine restored after a restart (WSL VM stop/start, daemon restart) can come
+        # back without its published port; recreating the web server container fixes it.
+        Write-DeployerWarn 'The site is not answering; recreating the web server container...'
+        [void](Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $Ctx.Runtime -Arguments @('up', '-d', '--force-recreate', 'caddy'))
+        $health = Wait-DeployerHealth -Port $Ctx.Port -TimeoutSeconds 120
+    }
+    if ($Ctx.Runtime -eq 'wsl-engine' -and -not (Get-DeployerKeepAliveProcess)) {
+        throw 'the WSL distro stopped while Deployer was starting (WSL updating itself?).'
+    }
+    return $health
+}
+
+function Invoke-Start {
+    $ctx = Get-Context
+    $marker = Join-Path $InstallDir $script:DeployerStopMarker
+    if ($Background) {
+        $script:DeployerQuiet = $true
+        $script:DeployerLogFile = Join-Path $InstallDir 'logs\deployer.log'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $script:DeployerLogFile) -Force | Out-Null
+        $log = Get-Item -LiteralPath $script:DeployerLogFile -ErrorAction SilentlyContinue
+        if ($log -and $log.Length -gt 1MB) { Move-Item -LiteralPath $log.FullName -Destination "$($log.FullName).1" -Force }
+        if (Test-Path -LiteralPath $marker) {
+            # The task also runs every 5 minutes as a watchdog (Register-DeployerTask). A stop from this
+            # sign-in stays a stop; a marker older than the sign-in is from an earlier one, and a sign-in starts.
+            $signIn = Get-DeployerSignInTime
+            if ($signIn -and (Get-Item -LiteralPath $marker).LastWriteTime -gt $signIn) {
+                Write-DeployerLog 'INFO' 'Deployer was stopped on purpose ("deployer stop"); not starting it until "deployer start" or the next sign-in.'
+                return
+            }
+        }
+        Write-DeployerLog 'INFO' "Autostart (runtime $($ctx.Runtime))"
+        # The first 'deployer update' from a pre-A-067 install runs the old script, which never locks
+        # the WSL disk and logs; the elevated sign-in task does it instead.
+        if (Test-DeployerIsAdmin) {
+            try { Protect-DeployerDataDirs -InstallDir $InstallDir -UserSid ([string](Get-DeployerStateValue $ctx.State 'installUserSid' (Get-DeployerUserSid))) }
+            catch { Write-DeployerLog 'WARN' "Data folder permissions not tightened: $($_.Exception.Message)" }
+        }
+    }
+    Write-DeployerStep 'Starting Deployer'
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    if ($Background -and $ctx.Runtime -eq 'wsl-engine') {
+        # Blocks while the user is signed in: starts the stack, tries again when that fails (WSL
+        # updating itself at sign-in) and brings the stack back when the WSL VM stopped under it.
+        Invoke-DeployerKeepAliveLoop -InstallDir $InstallDir -Start {
+            Initialize-Engine -Ctx $ctx -TimeoutSeconds 300
+            $health = Start-Stack -Ctx $ctx
+            Write-DeployerLog 'INFO' $(if ($health) { 'Stack started.' } else { 'Stack started but the site is not answering.' })
+        }
+        return
+    }
+    Initialize-Engine -Ctx $ctx -TimeoutSeconds $(if ($Background) { 900 } else { 300 })
+    $health = Start-Stack -Ctx $ctx
+    if ($Background) {
+        Write-DeployerLog 'INFO' $(if ($health) { 'Stack started.' } else { 'Stack started but the site is not answering.' })
+        return
+    }
+    if ($health) {
+        Write-DeployerOk "Running at http://localhost:$($ctx.Port)"
+    } else {
+        Write-DeployerWarn "Started, but http://localhost:$($ctx.Port)/v1/health is not answering yet. Check 'deployer logs api'."
+    }
+    # `deployer stop` ends the sign-in task's loop; start it again so the stack comes back after sleep
+    # or a WSL restart. A no-op while it still runs (IgnoreNew).
+    if ($ctx.Runtime -eq 'wsl-engine' -and (Test-DeployerTaskRegistered)) {
+        try { Start-ScheduledTask -TaskName $script:DeployerTaskName -ErrorAction Stop } catch { Write-DeployerWarn "Could not start the sign-in task ($($_.Exception.Message)); Deployer will not come back by itself after sleep until you sign in again." }
+    }
+}
+
+function Invoke-Stop {
+    $ctx = Get-Context
+    Write-DeployerStep 'Stopping Deployer'
+    # Tell the sign-in task's keep-alive loop this stop is on purpose, before its keep-alive is ended.
+    try {
+        Set-Content -LiteralPath (Join-Path $InstallDir $script:DeployerStopMarker) -Value (Get-Date -Format 'o') -Encoding ASCII
+    } catch {
+        Write-DeployerWarn "Could not record the stop ($($_.Exception.Message)); the sign-in task may start Deployer again."
+    }
+    if (Test-DeployerDockerEngine -Runtime $ctx.Runtime) {
+        $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('stop')
+        if ($code -ne 0) { throw "docker compose stop failed (exit code $code)." }
+    } else {
+        Write-DeployerInfo 'The Docker engine is not running; nothing to stop.'
+    }
+    if ($ctx.Runtime -eq 'wsl-engine') {
+        Stop-DeployerKeepAlive
+        Write-DeployerInfo 'The WSL distro will shut down when idle, freeing its memory.'
+    }
+    Write-DeployerOk 'Stopped. Run "deployer start" to start again (it also starts at your next sign-in).'
+}
+
+function Invoke-Restart {
+    $ctx = Get-Context
+    Initialize-Engine -Ctx $ctx
+    if ($Service) {
+        $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('restart', $Service)
+        if ($code -ne 0) { throw "Restarting $Service failed (exit code $code)." }
+        Write-DeployerOk "Restarted $Service"
+        return
+    }
+    [void](Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('stop'))
+    Invoke-Start
+}
+
+function Invoke-StatusJson {
+    # One line "##deployer:status {json}" for Deployer Control. Read-only: never boots the WSL distro.
+    $result = [ordered]@{ installed = $false; installDir = $InstallDir }
+    $state = Read-DeployerState -InstallDir $InstallDir
+    if ($null -ne $state) {
+        $ctx = Get-Context
+        $lan = $ctx.Lan
+        $keepAwake = Get-DeployerStateValue $ctx.State 'keepAwake'
+        $result['installed'] = $true
+        $result['runtime'] = $ctx.Runtime
+        $result['port'] = $ctx.Port
+        $result['url'] = "http://localhost:$($ctx.Port)"
+        $result['publicUrl'] = [string]$ctx.Env['PUBLIC_URL']
+        $result['version'] = [string](Get-DeployerStateValue $ctx.State 'ref' '')
+        $result['imageVersion'] = [string]$ctx.Env['DEPLOYER_VERSION']
+        $result['managedMongodb'] = [bool](Get-DeployerStateValue $ctx.State 'managedMongodb' $true)
+        $result['autostart'] = (Test-DeployerTaskRegistered)
+        $result['lan'] = [bool](Get-DeployerStateValue $lan 'enabled' $false)
+        $result['lanMode'] = [string](Get-DeployerStateValue $lan 'mode' 'none')
+        if ($result['lan']) {
+            # Deployer Control shows these (A-075).
+            $result['lanUrls'] = @(Get-DeployerLanUrls -Port $ctx.Port)
+            $result['publicNetworks'] = @(Get-DeployerNonPrivateNetworks | ForEach-Object { [string]$_.Name })
+        }
+        $result['keepAwake'] = [bool](Get-DeployerStateValue $keepAwake 'enabled' $false)
+        $engine = $true
+        if ($ctx.Runtime -eq 'wsl-engine') { $engine = Test-DeployerWslDistroRunning }
+        if ($engine) { $engine = Test-DeployerDockerEngine -Runtime $ctx.Runtime }
+        $result['engine'] = [bool]$engine
+        $services = @()
+        if ($engine) { $services = @(Get-DeployerComposeServices -InstallDir $InstallDir -Runtime $ctx.Runtime) }
+        $result['services'] = @($services | ForEach-Object { [ordered]@{ name = $_.Service; state = $_.State; health = $_.Health; status = $_.Status } })
+        $health = Get-DeployerHealth -Port $ctx.Port
+        $result['healthy'] = [bool]$health
+        $result['health'] = $(if ($health) { [string]$health } else { '' })
+    }
+    Write-Output ('##deployer:status ' + (ConvertTo-Json -InputObject $result -Depth 6 -Compress))
+}
+
+function Get-OnOffArgument {
+    switch ($Service.ToLowerInvariant()) {
+        'on' { return $true }
+        'off' { return $false }
+        default { throw "Usage: deployer $Command on|off" }
+    }
+}
+
+function Save-ContextState {
+    param($Ctx, [hashtable]$Changes)
+    $table = ConvertTo-DeployerStateTable $Ctx.State
+    foreach ($k in $Changes.Keys) { $table[$k] = $Changes[$k] }
+    $table['updatedAt'] = (Get-Date).ToUniversalTime().ToString('o')
+    Save-DeployerState -InstallDir $InstallDir -State $table
+}
+
+function Restart-StackForSettings {
+    param($Ctx, [int]$Port)
+    if (-not (Test-DeployerDockerEngine -Runtime $Ctx.Runtime)) {
+        Write-DeployerInfo 'Deployer is not running; the change applies the next time it starts.'
+        return
+    }
+    $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $Ctx.Runtime -Arguments @('up', '-d', '--remove-orphans')
+    if ($code -ne 0) { throw "docker compose up failed (exit code $code)." }
+    if ($Ctx.Runtime -eq 'wsl-engine') { Start-DeployerKeepAlive }
+    if (Wait-DeployerHealth -Port $Port -TimeoutSeconds 240) {
+        Write-DeployerOk "Running at http://localhost:$Port"
+    } else {
+        Write-DeployerWarn "http://localhost:$Port/v1/health is not answering yet. Check 'deployer logs caddy'."
+    }
+}
+
+function Invoke-SetPort {
+    if ($Service -notmatch '^\d{1,5}$' -or [int]$Service -lt 1 -or [int]$Service -gt 65535) {
+        throw 'Usage: deployer set-port <port>   (a number from 1 to 65535, e.g. 8090)'
+    }
+    $newPort = [int]$Service
+    if (Test-DeployerAppPort $newPort) {
+        throw "Port $newPort is inside $($script:DeployerAppPortFirst)-$($script:DeployerAppPortLast), which Deployer keeps for deployed apps. Choose another port, e.g. 8090."
+    }
+    $ctx = Get-Context
+    if ($newPort -eq $ctx.Port) {
+        Write-DeployerOk "Deployer already uses port $newPort"
+        return
+    }
+    [void](Assert-Admin -Why 'change the port')
+    Write-DeployerStep "Changing the port from $($ctx.Port) to $newPort"
+    $listeners = @(Get-NetTCPConnection -LocalPort $newPort -State Listen -ErrorAction SilentlyContinue)
+    if ($listeners.Count -gt 0) {
+        $names = @($listeners | ForEach-Object { (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName } | Sort-Object -Unique)
+        throw "Port $newPort is already used by: $($names -join ', '). Choose a different port."
+    }
+    $values = [ordered]@{ DEPLOYER_HTTP_PORT = "$newPort" }
+    $oldUrl = [string]$ctx.Env['PUBLIC_URL']
+    if (-not $oldUrl -or $oldUrl -match '^http://(localhost|127\.0\.0\.1)(:\d+)?/?$') {
+        $values['PUBLIC_URL'] = "http://localhost:$newPort"
+    } else {
+        Write-DeployerWarn "PUBLIC_URL is $oldUrl and was left unchanged."
+    }
+    Set-DeployerEnvValues -Path (Join-Path $InstallDir '.env') -Values $values
+    Save-ContextState -Ctx $ctx -Changes @{ port = $newPort }
+    Write-DeployerOk '.env updated'
+
+    if ([bool](Get-DeployerStateValue $ctx.Lan 'enabled' $false)) {
+        Add-DeployerFirewallRule -Port $newPort
+        if ($ctx.Runtime -eq 'wsl-engine') {
+            Remove-DeployerPortProxy -Port $ctx.Port
+            [void](Update-DeployerPortProxy -Port $newPort)
+        }
+        Write-DeployerOk "Firewall rule moved to TCP $newPort"
+    }
+    Restart-StackForSettings -Ctx $ctx -Port $newPort
+    Write-DeployerInfo 'If you use Google/GitHub sign-in, register the new callback URLs in your OAuth apps ("deployer oauth status" lists them).'
+}
+
+function Invoke-Lan {
+    $ctx = Get-Context
+    $on = Get-OnOffArgument
+    [void](Assert-Admin -Why 'change firewall and network settings')
+    if ($on) {
+        Write-DeployerStep 'Allowing other devices on your private network'
+        if ($ctx.Runtime -eq 'wsl-engine') { Write-DeployerMirroredWarning }
+        if (Test-DeployerDockerEngine -Runtime $ctx.Runtime) {
+            $mode = Enable-DeployerLanAccess -Runtime $ctx.Runtime -Port $ctx.Port
+        } else {
+            Add-DeployerFirewallRule -Port $ctx.Port
+            $mode = if ($ctx.Runtime -ne 'wsl-engine') { 'direct' } else { 'portproxy' }
+            if ($mode -eq 'portproxy') { Write-DeployerInfo 'Port forwarding is set up the next time Deployer starts.' }
+        }
+        $bind = Get-DeployerBindAddress -Lan $true -Runtime $ctx.Runtime
+    } else {
+        Write-DeployerStep 'Blocking other devices on your network'
+        Disable-DeployerLanAccess -Port $ctx.Port
+        $mode = 'none'
+        $bind = Get-DeployerBindAddress -Lan $false -Runtime $ctx.Runtime
+    }
+    Set-DeployerEnvValues -Path (Join-Path $InstallDir '.env') -Values ([ordered]@{ DEPLOYER_BIND = $bind })
+    Save-ContextState -Ctx $ctx -Changes @{ lan = @{ enabled = $on; mode = $mode } }
+    Restart-StackForSettings -Ctx $ctx -Port $ctx.Port
+    if ($on) {
+        foreach ($lanUrl in @(Get-DeployerLanUrls -Port $ctx.Port)) { Write-DeployerOk "On your network: $lanUrl" }
+        [void](Write-DeployerNetworkProfileWarning)
+    } else {
+        Write-DeployerOk 'Deployer is reachable from this PC only'
+    }
+}
+
+function Invoke-Autostart {
+    $ctx = Get-Context
+    $on = Get-OnOffArgument
+    [void](Assert-Admin -Why 'change the sign-in task')
+    if ($on) {
+        Register-DeployerTask -InstallDir $InstallDir -Watchdog:($ctx.Runtime -eq 'wsl-engine')
+        Write-DeployerOk "Deployer starts when $([Security.Principal.WindowsIdentity]::GetCurrent().Name) signs in"
+    } else {
+        $wasRunning = ($ctx.Runtime -eq 'wsl-engine') -and [bool](Get-DeployerKeepAliveProcess)
+        Unregister-DeployerTask
+        # Removing the task can end its keep-alive; keep a running stack running.
+        if ($wasRunning) { Start-DeployerKeepAlive }
+        Write-DeployerOk 'Deployer no longer starts automatically at sign-in'
+    }
+    Save-ContextState -Ctx $ctx -Changes @{ autostart = $on }
+}
+
+function Invoke-KeepAwake {
+    $ctx = Get-Context
+    $on = Get-OnOffArgument
+    $previous = Get-DeployerStateValue $ctx.State 'keepAwake'
+    if (-not $on -and -not [bool](Get-DeployerStateValue $previous 'enabled' $false)) {
+        Write-DeployerOk 'Keep awake is already off; power settings were not changed'
+        return
+    }
+    [void](Assert-Admin -Why 'change power settings')
+    $table = Set-DeployerKeepAwake -Enabled $on -Previous $previous
+    Save-ContextState -Ctx $ctx -Changes @{ keepAwake = $table }
+}
+
+function Invoke-Device {
+    # Runs the API's own CLI inside the api container: python -m app.cli device status|detach
+    $ctx = Get-Context
+    $sub = $Service.ToLowerInvariant()
+    if ($sub -notin @('status', 'detach')) { throw 'Usage: deployer device status | deployer device detach [-Force] [-Yes]' }
+    if (-not (Test-DeployerDockerEngine -Runtime $ctx.Runtime)) {
+        throw 'Deployer is not running. Start it first with "deployer start".'
+    }
+    $cliArgs = @('exec', '-T', 'api', 'python', '-m', 'app.cli', 'device', $sub)
+    if ($sub -eq 'detach') {
+        Write-DeployerStep 'Detach this PC from its main Deployer'
+        Write-DeployerWarn 'This PC forgets the main Deployer it is attached to. The main Deployer shows it as offline'
+        Write-DeployerWarn 'until its owner removes it there. Databases hosted here are kept on this PC (nothing is deleted).'
+        if (-not $Force) {
+            Write-DeployerInfo 'Detaching is refused while this PC still hosts databases; move them first or add -Force.'
+        }
+        if (-not $Yes) {
+            $answer = Read-Host '    Type DETACH to continue'
+            if ($answer -cne 'DETACH') { Write-DeployerInfo 'Cancelled.'; return }
+        }
+        if ($Force) { $cliArgs += '--force' }
+    }
+    $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments $cliArgs
+    if ($code -ne 0) { throw "deployer device $sub failed (exit code $code)." }
+}
+
+function Invoke-OAuth {
+    # Google/GitHub sign-in apps through the API's CLI: python -m app.cli oauth status|set|clear.
+    # The secret only ever travels on stdin - never on a command line and never into the log.
+    $ctx = Get-Context
+    $sub = $Service.ToLowerInvariant()
+    $provider = if ($Rest.Count -gt 0) { "$($Rest[0])".ToLowerInvariant() } else { '' }
+    $usage = 'Usage: deployer oauth status [-Json] | deployer oauth set google|github | deployer oauth clear google|github'
+    if ($sub -notin @('status', 'set', 'clear') -or ($sub -ne 'status' -and $provider -notin @('google', 'github'))) { throw $usage }
+    $stdin = ''
+    if ($sub -eq 'set') {
+        $id = $env:DEPLOYER_OAUTH_CLIENT_ID
+        $secret = $env:DEPLOYER_OAUTH_CLIENT_SECRET
+        if ($null -eq $id) {
+            try {
+                $id = Read-Host "    $provider Client ID"
+                $secret = Read-SecretPrompt 'Client secret (leave empty to keep the saved one)'
+            } catch {
+                throw 'Set DEPLOYER_OAUTH_CLIENT_ID and DEPLOYER_OAUTH_CLIENT_SECRET, or run this in an interactive PowerShell window.'
+            }
+        }
+        $stdin = ConvertTo-Json -Compress -InputObject @{ client_id = "$id"; client_secret = "$secret" }
+    }
+    if (-not (Test-DeployerDockerEngine -Runtime $ctx.Runtime)) {
+        throw 'Deployer is not running. Start it first with "deployer start".'
+    }
+    $cliArgs = @('exec', '-T', 'api', 'python', '-m', 'app.cli', 'oauth', $sub)
+    if ($sub -ne 'status') { $cliArgs += @('--provider', $provider) }
+    $r = Invoke-DeployerComposeCapture -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments $cliArgs -StdinText $stdin -TimeoutSeconds 120
+    $lines = @($r.Output -split "`r?`n" | Where-Object { $_.Trim() })
+    if ($r.ExitCode -ne 0) {
+        # The CLI prints one line saying what was wrong (e.g. the whole ID/secret block was pasted).
+        $why = if ($r.ExitCode -eq 2 -and $r.StdOut.Trim()) { $r.StdOut.Trim() } elseif ($lines) { $lines[-1] } else { "exit code $($r.ExitCode)" }
+        throw $why
+    }
+    if ($sub -ne 'status') { Write-DeployerOk $r.StdOut.Trim(); return }
+    if ($Json) { Write-Output $r.StdOut.Trim(); return }
+    $s = $r.StdOut | ConvertFrom-Json
+    foreach ($name in @('google', 'github')) {
+        $p = $s.$name
+        $state = if ($p.configured) { "configured (Client ID $($p.client_id))" } elseif ($p.client_id) { 'Client secret missing' } else { 'not configured' }
+        Write-Host ''
+        Write-Host "  $($name.Substring(0, 1).ToUpperInvariant() + $name.Substring(1)): $state"
+        Write-Host "    Callback URL: $($p.callback_url)"
+    }
+    Write-Host ''
+}
+
+function Read-SecretPrompt {
+    param([string]$Prompt)
+    $secure = Read-Host "    $Prompt" -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+function Invoke-ResetPassword {
+    # Forgotten-password recovery through the API's CLI: python -m app.cli user reset-password [--email].
+    # Being on this PC is the proof of ownership. The password only travels on stdin (never argv, never the log).
+    $ctx = Get-Context
+    $email = $Service.Trim()
+    $password = $env:DEPLOYER_NEW_PASSWORD
+    if ($null -eq $password) {
+        try {
+            $password = Read-SecretPrompt 'New password (at least 10 characters)'
+            $again = Read-SecretPrompt 'Type it again'
+        } catch {
+            throw 'Set DEPLOYER_NEW_PASSWORD, or run this in an interactive PowerShell window.'
+        }
+        if ($password -cne $again) { throw 'The two passwords are different. Nothing was changed.' }
+    }
+    if (-not (Test-DeployerDockerEngine -Runtime $ctx.Runtime)) {
+        throw 'Deployer is not running. Start it first with "deployer start".'
+    }
+    $cliArgs = @('exec', '-T', 'api', 'python', '-m', 'app.cli', 'user', 'reset-password')
+    if ($email) { $cliArgs += @('--email', $email) }
+    $stdin = ConvertTo-Json -Compress -InputObject @{ password = "$password" }
+    $r = Invoke-DeployerComposeCapture -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments $cliArgs -StdinText $stdin -TimeoutSeconds 120
+    if ($r.ExitCode -ne 0) {
+        $lines = @($r.Output -split "`r?`n" | Where-Object { $_.Trim() })
+        $why = if ($r.ExitCode -eq 2 -and $r.StdOut.Trim()) { $r.StdOut.Trim() } elseif ($lines) { $lines[-1] } else { "exit code $($r.ExitCode)" }
+        throw $why
+    }
+    Write-DeployerOk $r.StdOut.Trim()
+}
+
+function Invoke-Status {
+    if ($Json) { Invoke-StatusJson; return }
+    $ctx = Get-Context
+    Write-DeployerStep 'Deployer status'
+    Write-DeployerInfo "Install dir : $InstallDir"
+    Write-DeployerInfo "Runtime     : $($ctx.Runtime)"
+    Write-DeployerInfo "Version     : $(Get-DeployerStateValue $ctx.State 'ref' 'unknown') (images: $($ctx.Env['DEPLOYER_VERSION']))"
+    Write-DeployerInfo "URL         : http://localhost:$($ctx.Port)"
+    $task = Get-ScheduledTask -TaskName $script:DeployerTaskName -ErrorAction SilentlyContinue
+    Write-DeployerInfo ("Autostart   : {0}" -f $(if ($task) { "scheduled task ($($task.State))" } else { 'not registered' }))
+    if ($ctx.Runtime -eq 'wsl-engine') {
+        Write-DeployerInfo ("Keep-alive  : {0}" -f $(if (Get-DeployerKeepAliveProcess) { 'running' } else { 'not running' }))
+    }
+    if (-not (Test-DeployerDockerEngine -Runtime $ctx.Runtime)) {
+        Write-DeployerWarn 'Docker engine: not reachable. Run "deployer start".'
+        return
+    }
+    Write-DeployerOk 'Docker engine reachable'
+    [void](Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('ps'))
+    $health = Get-DeployerHealth -Port $ctx.Port -AnyStatus
+    if ($health) { Write-DeployerHealth $health } else { Write-DeployerWarn "Health endpoint http://localhost:$($ctx.Port)/v1/health is not answering." }
+}
+
+function Invoke-Logs {
+    $ctx = Get-Context
+    $composeArgs = @('logs', '--tail', "$Tail")
+    if ($Follow) { $composeArgs += '--follow' }
+    if ($Service) { $composeArgs += $Service }
+    $inv = Get-DeployerComposeInvocation -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments $composeArgs
+    & $inv.File @($inv.Args)
+}
+
+function Invoke-Compose {
+    $ctx = Get-Context
+    $composeArgs = @()
+    if ($Service) { $composeArgs += $Service }
+    $composeArgs += @($Rest | Where-Object { $_ -ne '--' })
+    if ($composeArgs.Count -eq 0) { throw 'Usage: deployer compose -- <docker compose arguments>' }
+    $inv = Get-DeployerComposeInvocation -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments $composeArgs
+    & $inv.File @($inv.Args)
+    exit $LASTEXITCODE
+}
+
+function Invoke-Update {
+    $ctx = Get-Context
+    [void](Assert-Admin -Why 'update program files and keep .env permissions locked down')
+    $repo = [string](Get-DeployerStateValue $ctx.State 'repo' 'nyx-ulrix/deployer')
+    $currentRef = [string](Get-DeployerStateValue $ctx.State 'ref' '')
+    $target = Resolve-DeployerRef -Repo $repo -Ref $Ref
+    Write-DeployerStep "Updating Deployer from $repo ($currentRef -> $target)"
+    $script:DeployerLogFile = Join-Path $InstallDir 'logs\deployer.log'
+
+    $backupFirst = Read-DeployerYesNo -Question 'Take a backup before updating?' -Default $true -NonInteractive:$Yes
+    $script:DeployerLastBackup = ''
+    if ($backupFirst) { Invoke-Backup }
+
+    $work = Join-Path $env:TEMP 'deployer-update'
+    $root = Get-DeployerSource -Repo $repo -Ref $target -WorkDir $work
+    $mongo = [bool](Get-DeployerStateValue $ctx.State 'managedMongodb' $true)
+    # V-07: whether the version that was running can open MongoDB 8.0 data, for the way back.
+    $previousMongo8 = Test-DeployerComposeMongoImage -Path (Join-Path $InstallDir 'docker-compose.yml')
+    $replaced = $false
+    try {
+        if ($mongo) { Assert-DeployerMongoRef -InstallDir $InstallDir -SourceRoot $root -Ref $target }
+        $replaced = $true
+        Copy-DeployerFiles -SourceRoot $root -InstallDir $InstallDir
+        # Installs from before A-067 left the WSL disk and logs readable by every local user.
+        Protect-DeployerDataDirs -InstallDir $InstallDir -UserSid ([string](Get-DeployerStateValue $ctx.State 'installUserSid' (Get-DeployerUserSid)))
+
+        $bind = if ($ctx.Env['DEPLOYER_BIND']) { [string]$ctx.Env['DEPLOYER_BIND'] } else { '127.0.0.1' }
+        [void](Initialize-DeployerEnv -InstallDir $InstallDir -Port $ctx.Port -MongoEnabled $mongo `
+                -ImagePrefix (Get-DeployerImagePrefix -Repo $repo) -Version (Get-DeployerImageVersion -Ref $target) -Bind $bind)
+        Write-DeployerOk 'Deploy files updated; .env kept'
+
+        Initialize-Engine -Ctx $ctx
+        $mode = Invoke-DeployerImages -InstallDir $InstallDir -Runtime $ctx.Runtime -FromSource:$FromSource
+        if ($mongo) { Update-DeployerMongo -InstallDir $InstallDir -Runtime $ctx.Runtime }
+        $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('up', '-d', '--remove-orphans')
+        if ($code -ne 0) {
+            Show-DeployerDiagnostics -InstallDir $InstallDir -Runtime $ctx.Runtime
+            throw "docker compose up failed (exit code $code)."
+        }
+        $timeout = if ($mode -eq 'built') { 600 } else { 420 }
+        $health = Wait-DeployerHealth -Port $ctx.Port -TimeoutSeconds $timeout
+        if (-not $health) {
+            Show-DeployerDiagnostics -InstallDir $InstallDir -Runtime $ctx.Runtime
+            throw 'Deployer did not become healthy after the update.'
+        }
+    } catch {
+        if (-not $replaced) { throw }
+        # The old deploy files are already replaced, so name the way back (A-150).
+        $mongoNewer = $mongo -and -not $previousMongo8 -and [bool]((Read-DeployerEnvFile -Path (Join-Path $InstallDir '.env'))['MONGODB_IMAGE'])
+        throw ("{0}`n{1}" -f $_.Exception.Message, (Get-DeployerUpdateRecoveryHint -PreviousRef $currentRef -BackupName $script:DeployerLastBackup -MongoNewer:$mongoNewer))
+    } finally {
+        # A-151: the downloaded source is in the install folder now (or not wanted); free %TEMP%.
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $table = ConvertTo-DeployerStateTable $ctx.State
+    $table['ref'] = $target
+    $table['updatedAt'] = (Get-Date).ToUniversalTime().ToString('o')
+    Save-DeployerState -InstallDir $InstallDir -State $table
+    try { [void](Set-DeployerDisplayVersion -Ref $target) } catch { Write-DeployerLog 'WARN' "Apps & Features version not updated: $($_.Exception.Message)" }
+    Write-DeployerOk "Updated to $target"
+    if (Test-DeployerTaskRegistered) {
+        # The sign-in task's definition changes between versions (K: the WSL watchdog repeat). This process
+        # runs the version being replaced, so the new files register it; it repeats from the next sign-in.
+        & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -ExecutionPolicy Bypass `
+            -File (Join-Path $InstallDir 'installer\deployer.ps1') autostart on -InstallDir $InstallDir
+        if ($LASTEXITCODE -ne 0) { Write-DeployerWarn 'The sign-in task was not updated; run setup again (Deployer Control -> Settings) to update it.' }
+        if ($ctx.Runtime -eq 'wsl-engine') {
+            # The update started Deployer, so bring back the task's keep-alive loop too (a no-op while it runs).
+            Remove-Item -LiteralPath (Join-Path $InstallDir $script:DeployerStopMarker) -Force -ErrorAction SilentlyContinue
+            try { Start-ScheduledTask -TaskName $script:DeployerTaskName -ErrorAction Stop } catch { Write-DeployerWarn "Could not start the sign-in task ($($_.Exception.Message))." }
+        }
+    }
+    [void](Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('image', 'prune', '-f'))
+}
+
+function Invoke-Backup {
+    $ctx = Get-Context
+    Initialize-Engine -Ctx $ctx
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $dir = Join-Path $InstallDir "backups\$stamp"
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    if (Test-DeployerIsAdmin) { Set-DeployerPrivateAcl -Path (Join-Path $InstallDir 'backups') }
+    Write-DeployerStep "Backing up to $dir"
+    $runtimeDir = ConvertTo-DeployerRuntimePath -Runtime $ctx.Runtime -WindowsPath $dir
+
+    Copy-Item -LiteralPath (Join-Path $InstallDir '.env') -Destination (Join-Path $dir 'env.backup')
+    Write-DeployerOk '.env copied (contains MASTER_KEY - keep this folder private)'
+
+    # MariaDB: dump inside the container, then copy the file out (avoids console encoding issues).
+    $dump = 'export MYSQL_PWD=$MARIADB_ROOT_PASSWORD; exec mariadb-dump -uroot --all-databases --single-transaction --quick --routines --events --triggers --hex-blob --result-file=/tmp/deployer-mariadb.sql'
+    $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('exec', '-T', 'mariadb', 'sh', '-c', $dump)
+    if ($code -ne 0) { throw "mariadb-dump failed (exit code $code). Is the stack running?" }
+    $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('cp', 'mariadb:/tmp/deployer-mariadb.sql', "$runtimeDir/mariadb.sql")
+    [void](Invoke-DeployerComposeCapture -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('exec', '-T', 'mariadb', 'rm', '-f', '/tmp/deployer-mariadb.sql'))
+    if ($code -ne 0) { throw "Copying the MariaDB dump failed (exit code $code)." }
+    Write-DeployerOk 'MariaDB dumped to mariadb.sql'
+
+    if ($ctx.Env['COMPOSE_PROFILES'] -match 'mongodb') {
+        $mongoDump = 'exec mongodump --quiet --username=$MONGO_INITDB_ROOT_USERNAME --password=$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase=admin --gzip --archive=/tmp/deployer-mongodb.archive.gz'
+        $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('exec', '-T', 'mongodb', 'sh', '-c', $mongoDump)
+        if ($code -ne 0) { throw "mongodump failed (exit code $code)." }
+        $code = Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('cp', 'mongodb:/tmp/deployer-mongodb.archive.gz', "$runtimeDir/mongodb.archive.gz")
+        [void](Invoke-DeployerComposeCapture -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments @('exec', '-T', 'mongodb', 'rm', '-f', '/tmp/deployer-mongodb.archive.gz'))
+        if ($code -ne 0) { throw "Copying the MongoDB dump failed (exit code $code)." }
+        Write-DeployerOk 'MongoDB dumped to mongodb.archive.gz'
+    } else {
+        Write-DeployerInfo 'Managed MongoDB is disabled; skipped.'
+    }
+
+    $readme = @(
+        "Deployer backup $stamp",
+        '',
+        'env.backup           copy of .env (MASTER_KEY decrypts secrets stored in MariaDB)',
+        'mariadb.sql          mariadb-dump --all-databases',
+        'mongodb.archive.gz   mongodump --gzip --archive (if managed MongoDB is enabled)',
+        '',
+        'Restore (replaces the current databases; offers a backup of them first):',
+        "  deployer restore $stamp",
+        'It only goes back onto this install (same MASTER_KEY and database passwords as env.backup).',
+        '',
+        'For moving to another computer, prefer the encrypted export in the dashboard (Instance settings > Export).'
+    )
+    Write-DeployerTextFile -Path (Join-Path $dir 'README.txt') -Lines $readme
+    Write-DeployerOk "Backup complete: $dir"
+    $script:DeployerLastBackup = $stamp
+}
+
+function Invoke-Restore {
+    if (-not $Service) { throw 'Usage: deployer restore <backup folder or backups\<timestamp> name> [-Yes] [-Force]' }
+    $ctx = Get-Context
+    $folder = if (Test-Path -LiteralPath $Service -PathType Container) { $Service } else { Join-Path $InstallDir "backups\$Service" }
+    $folder = [System.IO.Path]::GetFullPath($folder).TrimEnd('')
+    Assert-DeployerRestoreFolder -InstallDir $InstallDir -Folder $folder -Force:$Force
+    Write-DeployerStep "Restore Deployer from $folder"
+    Write-DeployerWarn 'This REPLACES every database in this Deployer (MariaDB, and MongoDB if the backup has it) with the backup.'
+    if (-not $Yes) {
+        $answer = Read-Host '    Type RESTORE to continue'
+        if ($answer -cne 'RESTORE') { Write-DeployerInfo 'Cancelled.'; return }
+    }
+    Initialize-Engine -Ctx $ctx
+    if (Read-DeployerYesNo -Question 'Back up the current databases first?' -Default $true -NonInteractive:$Yes) { Invoke-Backup }
+    Invoke-DeployerRestore -InstallDir $InstallDir -Runtime $ctx.Runtime -Folder $folder -Force:$Force `
+        -Mongo ($ctx.Env['COMPOSE_PROFILES'] -match 'mongodb')
+    Write-DeployerOk "Restored. Run 'deployer restart' so every service picks up the restored data."
+}
+
+function Invoke-Open {
+    $ctx = Get-Context
+    Open-DeployerUrl -Url "http://localhost:$($ctx.Port)/"
+}
+
+function Invoke-Config {
+    $ctx = Get-Context
+    Write-DeployerStep 'Deployer configuration'
+    foreach ($p in $ctx.State.PSObject.Properties) {
+        $value = if ($p.Value -is [System.Management.Automation.PSCustomObject]) { ($p.Value | ConvertTo-Json -Compress) } else { $p.Value }
+        Write-DeployerInfo ('{0,-22} {1}' -f $p.Name, $value)
+    }
+    Write-Host ''
+    Write-DeployerInfo ".env ($InstallDir\.env) - secrets hidden:"
+    foreach ($key in $ctx.Env.Keys) {
+        $value = [string]$ctx.Env[$key]
+        if ($key -match 'PASSWORD|SECRET|MASTER_KEY|TOKEN') {
+            $value = if ($value) { '********' } else { '(empty)' }
+        }
+        Write-DeployerInfo ('{0,-24} {1}' -f $key, $value)
+    }
+}
+
+function Invoke-Uninstall {
+    $ctx = Get-Context
+    [void](Assert-Admin -Why 'remove the scheduled task, firewall rules and files')
+    Write-DeployerStep 'Uninstall Deployer'
+    if ($KeepData) {
+        Write-DeployerInfo 'Containers, the scheduled task and program files will be removed.'
+        Write-DeployerInfo 'Kept: databases (Docker volumes / WSL distro), .env and backups.'
+    } else {
+        Write-DeployerWarn 'This PERMANENTLY deletes all Deployer databases and settings on this PC:'
+        $extra = if ($ctx.Runtime -eq 'wsl-engine') { ' and the WSL distro "deployer"' } else { '' }
+        Write-DeployerWarn ('containers, Docker volumes, .env, backups' + $extra + '.')
+        Write-DeployerInfo 'Tip: run "deployer backup" or export from the dashboard first, or use -KeepData.'
+    }
+    if (-not $Yes) {
+        $answer = Read-Host '    Type UNINSTALL to continue'
+        if ($answer -cne 'UNINSTALL') { Write-DeployerInfo 'Cancelled.'; return }
+    }
+
+    Set-Location -LiteralPath $env:TEMP
+    Unregister-DeployerTask
+    Write-DeployerOk 'Scheduled task removed'
+    try {
+        Restore-DeployerKeepAwake -State $ctx.State
+    } catch {
+        Write-DeployerWarn "Could not restore your sleep settings: $($_.Exception.Message). Set them in Settings > System > Power."
+    }
+
+    if (Test-DeployerDockerEngine -Runtime $ctx.Runtime) {
+        $downArgs = @('--profile', 'mongodb', 'down', '--remove-orphans')
+        if (-not $KeepData) { $downArgs += '--volumes' }
+        [void](Invoke-DeployerCompose -InstallDir $InstallDir -Runtime $ctx.Runtime -Arguments $downArgs)
+        Write-DeployerOk 'Containers removed'
+    } else {
+        Write-DeployerWarn 'Docker engine not reachable; containers were not removed.'
+    }
+
+    if ($ctx.Runtime -eq 'wsl-engine') {
+        Stop-DeployerKeepAlive
+        if (-not $KeepData) {
+            [void](Invoke-DeployerNative -FilePath (Get-DeployerWslExe) -ArgumentList @('--unregister', $script:DeployerDistro) -TimeoutSeconds 300)
+            Write-DeployerOk 'WSL distro "deployer" removed'
+        } else {
+            [void](Invoke-DeployerNative -FilePath (Get-DeployerWslExe) -ArgumentList @('--terminate', $script:DeployerDistro) -TimeoutSeconds 120)
+            # Its disk is in $InstallDir\wsl, so the distro stays registered for the next install (L-08).
+            Write-DeployerInfo "The WSL distro `"deployer`" (your databases) stays registered on $InstallDir\wsl for the next install. To delete the data instead, run `"wsl --unregister deployer`", then delete $InstallDir."
+        }
+    }
+
+    Remove-DeployerFirewallRule
+    Remove-DeployerPortProxy -Port $ctx.Port
+    Remove-DeployerUserPath -Directory $InstallDir
+    Write-DeployerOk 'Firewall rule, port forwarding and PATH entry removed'
+
+    $keep = if ($KeepData) { @('.env', 'backups', 'wsl') } else { @() }
+    Get-ChildItem -LiteralPath $InstallDir -Force | Where-Object { $keep -notcontains $_.Name } | ForEach-Object {
+        try {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-DeployerWarn "Could not remove $($_.FullName): $($_.Exception.Message)"
+        }
+    }
+    if (-not $KeepData) {
+        Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # What DeployerControl.exe /uninstall also removes, so this scripted path leaves no dead Apps & Features entry (A-157).
+    Remove-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Deployer' -Recurse -Force -ErrorAction SilentlyContinue
+    $programs = [Environment]::GetFolderPath('CommonPrograms')
+    foreach ($link in @((Join-Path $programs 'Deployer.lnk'), (Join-Path $programs 'Deployer Control.lnk'),
+            (Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Deployer.lnk'))) {
+        Remove-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+    }
+    if ($ctx.Runtime -eq 'docker-desktop') {
+        Write-DeployerInfo 'Docker Desktop itself was not removed; uninstall it from Windows Settings > Apps if you no longer need it.'
+    }
+    Write-DeployerOk 'Deployer has been uninstalled.'
+}
+
+try {
+    switch ($Command.ToLowerInvariant()) {
+        'status' { Invoke-Status }
+        'start' { Invoke-Start }
+        'stop' { Invoke-Stop }
+        'restart' { Invoke-Restart }
+        'logs' { Invoke-Logs }
+        'update' { Invoke-Update }
+        'backup' { Invoke-Backup }
+        'restore' { Invoke-Restore }
+        'open' { Invoke-Open }
+        'config' { Invoke-Config }
+        'compose' { Invoke-Compose }
+        'uninstall' { Invoke-Uninstall }
+        'set-port' { Invoke-SetPort }
+        'lan' { Invoke-Lan }
+        'autostart' { Invoke-Autostart }
+        'keepawake' { Invoke-KeepAwake }
+        'device' { Invoke-Device }
+        'oauth' { Invoke-OAuth }
+        'reset-password' { Invoke-ResetPassword }
+        { $_ -in @('help', '-h', '--help', '/?') } { Show-Help }
+        default {
+            Write-DeployerError "Unknown command '$Command'."
+            Show-Help
+            exit 2
+        }
+    }
+} catch {
+    Write-DeployerError $_.Exception.Message
+    Write-DeployerLog 'ERROR' ($_ | Out-String)
+    if ($Elevated) {
+        # This window closes on exit; keep the error on screen until it has been read (A-142).
+        try { [void](Read-Host '    Press Enter to close this window') } catch { Write-Verbose 'No console to pause in.' }
+    }
+    exit 1
+}

@@ -1,0 +1,289 @@
+"""Query log (docs/QUERY_EDITOR.md): every console run is logged; list/get/delete permissions; pruning."""
+
+import time
+from datetime import timedelta
+
+import pytest
+from sqlalchemy import func, select
+
+from app.errors import ApiError
+from app.models import AuditLog, QueryRun, utcnow
+from app.serializers import iso
+from app.services import connections, query_log, source_ops
+
+PG = "postgresql"  # built at runtime so gitleaks' database-uri rule does not flag the fake URIs below
+
+
+@pytest.fixture
+def console(client, db, project_setup, sqlite_engine, monkeypatch, make_source):
+    monkeypatch.setattr(connections, "get_sql_engine", lambda ds: sqlite_engine)
+    ds = make_source(project_setup["project"])
+    return {**project_setup, "ds": ds, "url": f"{project_setup['base']}/{ds.id}/query"}
+
+
+def runs(db) -> list[QueryRun]:
+    db.expire_all()
+    return list(db.scalars(select(QueryRun).order_by(QueryRun.created_at, QueryRun.id)))
+
+
+def test_runs_are_logged_with_outcome(client, db, console, monkeypatch):
+    url, log_url = console["url"], f"/v1/projects/{console['project'].id}/query-log"
+    ok = client.post(
+        url,
+        json={"query": "INSERT INTO items (name) VALUES ('x'); SELECT id FROM items", "layout": "editor"},
+        headers=console["dev"],
+    )
+    assert ok.status_code == 200 and isinstance(ok.json()["run_id"], str)
+    failed = client.post(url, json={"query": "SELECT 1; SELEC oops", "layout": "terminal"}, headers=console["dev"])
+    assert failed.status_code == 200
+    refused = client.post(url, json={"query": "DELETE FROM items"}, headers=console["viewer"])
+    assert refused.status_code == 403 and refused.json()["error"]["code"] == "read_only_role"
+
+    def boom(code, status):
+        def fake(*a, **k):
+            raise ApiError(status, code, f"failed with {code}")
+
+        return fake
+
+    monkeypatch.setattr(source_ops, "run_query", boom("query_timeout", 504))
+    assert client.post(url, json={"query": "SELECT sleep(9)"}, headers=console["dev"]).status_code == 504
+    monkeypatch.setattr(source_ops, "run_query", boom("database_unavailable", 503))
+    assert client.post(url, json={"query": "SELECT 2"}, headers=console["dev"]).status_code == 503
+
+    rows = runs(db)
+    assert [r.status for r in rows] == ["ok", "error", "refused", "timeout", "error"]
+    assert [r.layout for r in rows] == ["editor", "terminal", "api", "api", "api"]
+    assert [r.read_only for r in rows] == [False, False, True, False, False]
+    first, second, third, fourth, fifth = rows
+    assert first.id == ok.json()["run_id"] and first.statements == 2 and first.rows == 8 and first.affected_rows == 1
+    assert first.query_text.startswith("INSERT INTO items") and first.error_message is None
+    assert second.statements == 2 and second.rows == 1 and second.affected_rows is None
+    assert "syntax" in second.error_message.lower()
+    assert third.query_text == "DELETE FROM items" and third.statements == 0 and "read-only" in third.error_message
+    assert (
+        fourth.error_message == "failed with query_timeout"
+        and fifth.error_message == "failed with database_unavailable"
+    )
+    assert all(r.user_email and r.source_name == console["ds"].name and r.kind == "sql" for r in rows)
+    assert all(r.project_id == console["project"].id and isinstance(r.duration_ms, int) for r in rows)
+    # Audit rows still carry counts only.
+    audits = list(db.scalars(select(AuditLog).where(AuditLog.action == "query.run").order_by(AuditLog.id)))
+    assert len(audits) == 5 and not any("items" in str(a.details) for a in audits)
+    # A-122: the audit outcome is read off the log row, so the two never disagree.
+    assert [a.details["ok"] for a in audits] == [r.status == "ok" for r in rows] == [True, False, False, False, False]
+    assert [a.details["statements"] for a in audits] == [2, 2, None, None, None]
+
+    resp = client.get(log_url, headers=console["viewer"])
+    assert resp.status_code == 200 and [r["status"] for r in resp.json()["runs"]] == ["refused"]
+
+
+def test_list_filters_and_permissions(client, db, console, make_source):
+    url, log_url = console["url"], f"/v1/projects/{console['project'].id}/query-log"
+    other = make_source(console["project"], name="second")
+    for i in range(3):
+        assert client.post(url, json={"query": f"SELECT {i}"}, headers=console["dev"]).status_code == 200
+    assert client.post(url, json={"query": "SELECT 'v'"}, headers=console["viewer"]).status_code == 200
+    long_text = "SELECT '" + "x" * 3000 + "'"
+    assert client.post(url, json={"query": long_text}, headers=console["owner"]).status_code == 200
+    # Same sqlite engine behind every source in this test; only the log's source id differs.
+    assert (
+        client.post(
+            f"{console['base']}/{other.id}/query", json={"query": "SELECT 9"}, headers=console["dev"]
+        ).status_code
+        == 200
+    )
+
+    mine = client.get(log_url, headers=console["dev"]).json()
+    assert [r["query_text"] for r in mine["runs"]] == ["SELECT 9", "SELECT 2", "SELECT 1", "SELECT 0"]
+    assert mine["has_more"] is False and all("query_truncated" not in r for r in mine["runs"])
+    assert client.get(log_url, params={"user": "all"}, headers=console["dev"]).status_code == 403
+    assert client.get(log_url, params={"user": "all"}, headers=console["viewer"]).status_code == 403
+
+    everyone = client.get(log_url, params={"user": "all"}, headers=console["owner"]).json()
+    assert len(everyone["runs"]) == 6
+    truncated = next(r for r in everyone["runs"] if r.get("query_truncated") is True)
+    assert len(truncated["query_text"]) == 2000
+    assert set(everyone["runs"][0]) >= {
+        "id", "project_id", "data_source_id", "source_name", "kind", "engine", "user_id", "user_email",
+        "query_text", "status", "statements", "rows", "affected_rows", "duration_ms", "error_message",
+        "read_only", "layout", "created_at",
+    }  # fmt: skip
+    assert everyone["runs"][0]["created_at"].endswith("Z")
+
+    by_source = client.get(log_url, params={"user": "all", "source_id": other.id}, headers=console["owner"]).json()
+    assert [r["query_text"] for r in by_source["runs"]] == ["SELECT 9"]
+
+    # A-032: MariaDB keeps whole seconds, so runs share timestamps; paging by (created_at, id) keeps them all.
+    same = utcnow().replace(microsecond=0)
+    for r in runs(db):
+        r.created_at = same
+    db.commit()
+    seen, params = [], {"user": "all", "limit": 2}
+    for _ in range(6):  # bounded: a broken cursor repeats pages forever
+        page = client.get(log_url, params=params, headers=console["owner"]).json()
+        seen += [r["id"] for r in page["runs"]]
+        if not page["has_more"]:
+            break
+        params = {**params, "before": page["runs"][-1]["created_at"], "before_id": page["runs"][-1]["id"]}
+    assert len(seen) == 6 and len(set(seen)) == 6
+    # Without `before_id` the timestamp is a plain cutoff (and still a valid filter).
+    cutoff = client.get(log_url, params={"user": "all", "before": iso(same)}, headers=console["owner"]).json()
+    assert cutoff["runs"] == []
+    assert client.get(log_url, params={"before": "yesterday"}, headers=console["owner"]).status_code == 422
+    assert client.get(log_url, params={"limit": 0}, headers=console["owner"]).status_code == 422
+    assert client.get(log_url, params={"limit": 201}, headers=console["owner"]).status_code == 422
+
+
+def test_get_and_delete(client, db, console, make_user, make_project, auth_headers):
+    url, log_url = console["url"], f"/v1/projects/{console['project'].id}/query-log"
+    viewer_run = client.post(url, json={"query": "SELECT 'v'"}, headers=console["viewer"]).json()["run_id"]
+    dev_run = client.post(url, json={"query": "SELECT 'd'"}, headers=console["dev"]).json()["run_id"]
+
+    own = client.get(f"{log_url}/{viewer_run}", headers=console["viewer"])
+    assert own.status_code == 200 and own.json()["query_text"] == "SELECT 'v'" and "query_truncated" not in own.json()
+    assert client.get(f"{log_url}/{dev_run}", headers=console["viewer"]).status_code == 403
+    assert client.get(f"{log_url}/{dev_run}", headers=console["owner"]).status_code == 200
+    assert client.get(f"{log_url}/nope", headers=console["owner"]).status_code == 404
+    stranger = make_user()
+    other = make_project(stranger, "Other")
+    assert client.get(f"/v1/projects/{other.id}/query-log/{dev_run}", headers=auth_headers(stranger)).status_code == 404
+
+    cutoff = (utcnow() + timedelta(minutes=1)).isoformat() + "Z"
+    assert client.delete(log_url, params={"before": cutoff}, headers=console["dev"]).status_code == 403
+    assert client.delete(log_url, headers=console["owner"]).status_code == 422
+    resp = client.delete(log_url, params={"before": cutoff}, headers=console["owner"])
+    assert resp.status_code == 200 and resp.json() == {"deleted": 2}
+    assert runs(db) == []
+
+
+def test_prune(db, console, make_project, make_user, monkeypatch):
+    monkeypatch.setattr(query_log, "MAX_RUNS_PER_PROJECT", 3)
+    project, ds, user = console["project"], console["ds"], make_user()
+    second = make_project(user, "Second")
+    now = utcnow()
+
+    def add(pid, age_days):
+        run = query_log.record_run(
+            # layout "terminal": gitleaks' generic-key rule misfires on the three-letter layout value.
+            db,
+            project_id=pid,
+            ds=ds,
+            user=user,
+            query_text="SELECT 1",
+            read_only=False,
+            layout="terminal",
+            duration_ms=1,
+        )
+        run.created_at = now - timedelta(days=age_days)
+
+    for age in (0, 1, 2, 3, 4, 91):  # 6 rows: one expired, two beyond the cap
+        add(project.id, age)
+    for age in (0, 1):
+        add(second.id, age)
+    db.commit()
+    assert query_log.prune(db, now) == 3
+    db.commit()
+    kept = list(db.scalars(select(QueryRun).where(QueryRun.project_id == project.id).order_by(QueryRun.created_at)))
+    assert [(now - r.created_at).days for r in kept] == [2, 1, 0]
+    assert db.scalar(select(func.count()).select_from(QueryRun).where(QueryRun.project_id == second.id)) == 2
+    assert query_log.prune(db, now) == 0
+
+
+def test_worker_prunes_once_a_day(monkeypatch):
+    from app import worker
+
+    calls = []
+    monkeypatch.setattr(worker.jobs, "recover_stale", lambda: 0)
+    monkeypatch.setattr(worker.jobs, "redispatch_queued", lambda: 0)
+    monkeypatch.setattr("app.services.backups.scheduler_tick", lambda factory: [])
+    monkeypatch.setattr(query_log, "prune", lambda session: calls.append(session) or 0)
+    monkeypatch.setattr(worker, "_last_query_log_prune", float("-inf"))
+    worker.scheduler_tick()
+    worker.scheduler_tick()
+    assert len(calls) == 1
+
+
+def test_record_run_caps_text_and_trims_the_project(db, console, make_user, monkeypatch):
+    """A-031: a run keeps at most STORED_TEXT_LIMIT chars, and a crowded project is trimmed on
+    insert instead of waiting for the daily prune."""
+    monkeypatch.setattr(query_log, "MAX_RUNS_PER_PROJECT", 3)
+    monkeypatch.setattr(query_log, "PRUNE_SLACK", 1)
+    user = make_user()
+
+    def add(text="SELECT 1"):
+        run = query_log.record_run(
+            db,
+            project_id=console["project"].id,
+            ds=console["ds"],
+            user=user,
+            query_text=text,
+            read_only=False,
+            layout="terminal",
+            duration_ms=1,
+        )
+        db.commit()
+        return run
+
+    assert len(add("x" * 200_000).query_text) == query_log.STORED_TEXT_LIMIT
+    for _ in range(4):
+        add()
+    assert len(runs(db)) == 5  # 3 kept + 1 slack, then this insert
+    add()
+    assert len(runs(db)) == 4  # trimmed to 3 before the new row
+
+
+@pytest.mark.parametrize(
+    ("text", "stored"),
+    [
+        (
+            "CREATE USER 'a'@'%' IDENTIFIED BY 'typed''pw'; SELECT 1",
+            "CREATE USER 'a'@'%' IDENTIFIED BY '***'; SELECT 1",
+        ),
+        (
+            'ALTER USER b IDENTIFIED WITH caching_sha2_password BY "pw"',
+            "ALTER USER b IDENTIFIED WITH caching_sha2_password BY '***'",
+        ),
+        ("SET PASSWORD FOR 'a'@'h' = PASSWORD('pw')", "SET PASSWORD FOR 'a'@'h' = PASSWORD('***')"),
+        ("CREATE ROLE r LOGIN ENCRYPTED PASSWORD 'pw'", "CREATE ROLE r LOGIN ENCRYPTED PASSWORD '***'"),
+        ("db.createUser({user: 'u', pwd: 'pw', roles: []})", "db.createUser({user: 'u', pwd: '***', roles: []})"),
+        ("db.changeUserPassword('u', 'pw')", "db.changeUserPassword('u', '***')"),
+        ("SELECT password FROM t WHERE password = 'x'", "SELECT password FROM t WHERE password = 'x'"),
+        # V-05: URIs, libpq/ODBC connection strings and Mongo auth()
+        (f"SELECT * FROM dblink('{PG}://u:pw@h/db', 'q')", f"SELECT * FROM dblink('{PG}://u:***@h/db', 'q')"),
+        (
+            "SELECT dblink_connect('host=h user=u password=pw dbname=d')",
+            "SELECT dblink_connect('host=h user=u password=*** dbname=d')",
+        ),
+        ("SELECT dblink_connect('host=h password = pw')", "SELECT dblink_connect('host=h password = ***')"),
+        ("EXEC sp_x 'Server=h;Uid=u;Pwd=pw;'", "EXEC sp_x 'Server=h;Uid=u;Pwd=***;'"),
+        ("db.auth('u', 'pw')", "db.auth('u', '***')"),
+        ('db.getSiblingDB("admin").auth("u", "pw")', 'db.getSiblingDB("admin").auth("u", \'***\')'),
+        ("SET PASSWORD = PASSWORD('pw')", "SET PASSWORD = PASSWORD('***')"),
+        ("SELECT dblink_connect('host=h password=Pa(ss)w')", "SELECT dblink_connect('host=h password=***')"),
+        (
+            "SELECT dblink_connect('host=h password=''p w'' port=1')",
+            "SELECT dblink_connect('host=h password=*** port=1')",
+        ),
+        ("EXEC sp_x 'Server=h;Pwd={a;b};'", "EXEC sp_x 'Server=h;Pwd=***;'"),
+        ("UPDATE t SET password = md5('x')", "UPDATE t SET password = md5('x')"),
+    ],
+)
+def test_redact(text, stored):
+    assert query_log.redact(text) == stored
+
+
+def test_redact_is_linear():
+    """A 200 000-char request of repeated `SET PASSWORD` took ~7 s with an unbounded `[^=;]*`."""
+    started = time.monotonic()
+    query_log.redact("SET PASSWORD " * 15_000)
+    query_log.redact("://a:" * 40_000)  # V-05: ~20 s before connections.redact bounded the password run
+    query_log.redact("pwd=" * 50_000 + "(")  # V-05 follow-up: ~2 min with a backtracking end lookahead
+    query_log.redact("password=''" * 18_000)
+    assert time.monotonic() - started < 2
+
+
+def test_logged_text_masks_passwords(client, db, console):
+    """A-119: a typed password never reaches query_runs (nor its backups)."""
+    client.post(console["url"], json={"query": "CREATE USER x IDENTIFIED BY 'typed-pw'"}, headers=console["owner"])
+    [run] = runs(db)
+    assert run.query_text == "CREATE USER x IDENTIFIED BY '***'"

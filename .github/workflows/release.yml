@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Only the repository's own GITHUB_TOKEN is used - no personal secrets. Read-only by default; each job
+# asks for the one write scope it needs, so the signing job (which holds the PFX) cannot push anything.
+permissions:
+  contents: read
+
+jobs:
+  # A-190: the full CI suite (ci.yml, callable) gates the images - a tag that fails it publishes nothing.
+  tests:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  images:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    needs: tests
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - component: api
+            context: api
+          - component: dashboard
+            context: dashboard
+          # Cloudflare tunnel sidecar (docker-compose.yml service "tunnel").
+          - component: tunnel
+            context: deploy/tunnel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (lowercase owner)
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/deployer-${{ matrix.component }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          # v1.2.3 -> 1.2.3 (matches DEPLOYER_VERSION written by the installer). `latest` only for a
+          # final release: a pre-release tag (v1.2.3-rc.1) never replaces it (A-190).
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=deployer-${{ matrix.component }}
+            org.opencontainers.image.licenses=MIT
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: true
+          # Dashboard: pins its docs and agent-skill links to this tag (A-197). API: reported as the version (A-188).
+          build-args: |
+            DEPLOYER_REPO=${{ github.repository }}
+            DEPLOYER_REF=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  setup-exe:
+    name: DeployerSetup.exe
+    runs-on: windows-latest
+    env:
+      # Optional code signing. Forks without these secrets publish an unsigned exe.
+      HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_PFX != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer\windows\build.ps1 -Version "${{ github.ref_name }}" -Repo "${{ github.repository }}" -Ref "${{ github.ref_name }}"
+
+      - name: Self-test
+        shell: powershell
+        run: |
+          $outDir = Join-Path $PWD 'dist\selftest'
+          $p = Start-Process -FilePath dist\DeployerSetup.selftest.exe -ArgumentList '/selftest', "`"$outDir`"" -PassThru
+          if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; Write-Host '::error::Self-test timed out'; exit 1 }
+          Get-Content (Join-Path $outDir 'selftest-report.txt')
+          if ($p.ExitCode -ne 0) { Write-Host "::error::Self-test failed (exit code $($p.ExitCode))"; exit 1 }
+
+      - name: Sign with signtool
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: powershell
+        env:
+          WINDOWS_SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_PFX }}
+          WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX))
+          try {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+            if (-not $signtool) { throw 'signtool.exe not found' }
+            & $signtool.FullName sign /f $pfx /p $env:WINDOWS_SIGNING_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Deployer Setup" dist\DeployerSetup.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed ($LASTEXITCODE)" }
+            & $signtool.FullName verify /pa dist\DeployerSetup.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed ($LASTEXITCODE)" }
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Checksum
+        shell: powershell
+        run: |
+          $hash = (Get-FileHash dist\DeployerSetup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText("$PWD\dist\DeployerSetup.exe.sha256", "$hash  DeployerSetup.exe`n")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployer-setup-exe
+          path: |
+            dist/DeployerSetup.exe
+            dist/DeployerSetup.exe.sha256
+
+  bundle:
+    name: Deploy bundle + GitHub release
+    runs-on: ubuntu-latest
+    needs: [images, setup-exe]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build deployer-deploy.zip
+        run: |
+          mkdir -p dist
+          # deploy/ includes the sidecar build contexts (deploy/tunnel, deploy/mongodb) - never .env.
+          zip -r dist/deployer-deploy.zip deploy installer -x 'deploy/.env' -x 'installer/windows/obj/*' -x 'installer/windows/bin/*'
+          unzip -l dist/deployer-deploy.zip | grep -q 'deploy/tunnel/Dockerfile'
+          (cd dist && sha256sum deployer-deploy.zip > deployer-deploy.zip.sha256)
+          # The Linux installer: downloads this release's source and runs installer/deployer.sh install.
+          cp installer/install.sh dist/install.sh
+          (cd dist && sha256sum install.sh > install.sh.sha256)
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: deployer-setup-exe
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/DeployerSetup.exe
+            dist/DeployerSetup.exe.sha256
+            dist/deployer-deploy.zip
+            dist/deployer-deploy.zip.sha256
+            dist/install.sh
+            dist/install.sh.sha256
+          generate_release_notes: true
+          # Keeps an RC out of releases/latest, which the installer resolves when no -Ref is given (A-190).
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Install on Windows
+
+            **Easiest:** download **DeployerSetup.exe** below and double-click it. If Windows SmartScreen says
+            "Windows protected your PC", choose **More info → Run anyway** (the exe is not code-signed yet unless this
+            release says otherwise). Checksum: `DeployerSetup.exe.sha256`.
+
+            Or with PowerShell:
+
+            ```powershell
+            & ([scriptblock]::Create((irm https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/installer/install.ps1))) -Repo ${{ github.repository }} -Ref ${{ github.ref_name }}
+            ```
+
+            ## Install on Linux (headless servers too)
+
+            Debian, Ubuntu (Docker Engine is installed for you) or any x86_64 distribution with Docker + Compose 2.20+:
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/installer/install.sh | sudo bash -s -- --repo ${{ github.repository }} --ref ${{ github.ref_name }}
+            ```
+
+            Or download **install.sh** below (checksum: `install.sh.sha256`) and run `sudo bash install.sh --ref ${{ github.ref_name }}`. Then `sudo deployer guide`.
+            Setup guide: [docs/SETUP.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/SETUP.md).
+
+            Images: `ghcr.io/${{ github.repository_owner }}/deployer-api`, `deployer-dashboard` and `deployer-tunnel`, tagged with this version (without the leading `v`), and `latest` unless this is a pre-release. An install from a release pins its version in `.env` (`DEPLOYER_VERSION`).
+            Existing installs: `deployer update -Ref ${{ github.ref_name }}`.

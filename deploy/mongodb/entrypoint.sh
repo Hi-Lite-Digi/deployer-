@@ -1,0 +1,46 @@
+#!/bin/bash
+# Deployer MongoDB entrypoint wrapper (docs/BACKUPS.md).
+#
+# Point-in-time recovery needs an oplog, so the managed MongoDB runs as a single-node replica set
+# (`rs0`). Replica-set members authenticate each other with a keyfile; it is derived from
+# MONGO_INITDB_ROOT_PASSWORD so nothing extra has to be generated, stored or backed up. The file is
+# written to tmpfs-backed /tmp on every start (owner mongodb, mode 0400) and never leaves the
+# container. The replica set itself is initiated by the Deployer API/worker on startup
+# (app.services.backup_engine.ensure_mongo_replica_set), which also upgrades existing installs.
+set -euo pipefail
+
+keyfile="${DEPLOYER_MONGO_KEYFILE:-/tmp/deployer-mongo-keyfile}"
+if [ -z "${MONGO_INITDB_ROOT_PASSWORD:-}" ]; then
+    echo "deployer: MONGO_INITDB_ROOT_PASSWORD is required for the replica-set keyfile" >&2
+    exit 1
+fi
+umask 077
+# 64 hex chars from SHA-256, twice with different labels -> 128 base64-alphabet characters.
+{
+    printf '%s' "deployer-mongo-keyfile-v1:a:${MONGO_INITDB_ROOT_PASSWORD}" | sha256sum | cut -d' ' -f1
+    printf '%s' "deployer-mongo-keyfile-v1:b:${MONGO_INITDB_ROOT_PASSWORD}" | sha256sum | cut -d' ' -f1
+} | tr -d '\n' > "${keyfile}.tmp"
+mv -f "${keyfile}.tmp" "$keyfile"
+chown mongodb:mongodb "$keyfile"
+chmod 0400 "$keyfile"
+
+# Feature-compatibility marker for deploy/mongodb/upgrade.sh (A-143): a new volume starts at this
+# image's version. Data without the marker is from MongoDB 5.0 and needs `deployer update` first.
+if [ ! -e /data/db/WiredTiger ]; then
+    # The official images name their major (ENV MONGO_MAJOR, e.g. 8.0). `mongod --version` is only the
+    # fallback: it sometimes exits 1, which under pipefail ended this script with no message at all.
+    fcv="${MONGO_MAJOR:-}"
+    if [ -z "$fcv" ]; then
+        if ! version_out="$(mongod --version 2>&1)"; then
+            printf 'deployer: mongod --version failed:\n%s\n' "$version_out" >&2
+            exit 1
+        fi
+        fcv="$(sed -n 's/^db version v\([0-9]*\)\..*/\1.0/p' <<<"$version_out")"
+    fi
+    printf '%s\n' "$fcv" > /data/db/deployer-fcv
+    chown mongodb:mongodb /data/db/deployer-fcv
+elif [ ! -e /data/db/deployer-fcv ]; then
+    echo "deployer: this MongoDB data is from MongoDB 5.0; run 'deployer update' to upgrade it (docs/BACKUPS.md)" >&2
+fi
+
+exec /usr/local/bin/docker-entrypoint.sh "$@"

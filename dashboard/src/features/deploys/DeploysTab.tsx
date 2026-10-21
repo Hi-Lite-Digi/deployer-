@@ -1,0 +1,103 @@
+import { useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import { ExternalLink, Plus, Rocket } from "lucide-react";
+import { useApps } from "../../api/hooks";
+import type { App } from "../../api/types";
+import { Badge } from "../../components/ui/Badge";
+import { Button } from "../../components/ui/Button";
+import { StatusDot } from "../../components/ui/Progress";
+import { PageSpinner } from "../../components/ui/Spinner";
+import { EmptyState, ErrorState } from "../../components/ui/States";
+import { relativeTime } from "../../lib/format";
+import { useProjectContext } from "../projects/project-context";
+import { isActive, PRESETS, TARGET_SHORT } from "./deploys";
+import { NewAppDialog } from "./NewAppDialog";
+
+/** Live status: green when routed, amber pulse while a deploy runs, grey otherwise. */
+export function AppStatusDot({ app, active = false }: { app: App; active?: boolean }) {
+  const live = app.live_deployment?.status === "live";
+  const busy = active || isActive(app.live_deployment?.status);
+  return <StatusDot tone={busy ? "warning" : live ? "success" : "muted"} pulse={busy} />;
+}
+
+export function DeploysTab() {
+  const { project, can } = useProjectContext();
+  const apps = useApps(project.id);
+  // `?new=1`: back from connecting GitHub in the New app dialog (docs/DEPLOYMENTS.md).
+  const [params, setParams] = useSearchParams();
+  const [creating, setCreating] = useState(params.get("new") === "1");
+  const closeNew = () => {
+    setCreating(false);
+    if (params.has("new")) setParams({}, { replace: true });
+  };
+  const base = `/projects/${project.id}/deploys`;
+
+  const newApp = can("developer") && (
+    <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => setCreating(true)}>
+      New app
+    </Button>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <p className="max-w-2xl text-sm text-muted">
+          Import a GitHub repository to get started. Every push to your production branch builds and deploys the latest
+          version. View logs or roll back to an earlier deployment here.
+        </p>
+        {newApp}
+      </div>
+
+      {apps.isPending ? (
+        <PageSpinner />
+      ) : apps.isError ? (
+        <ErrorState error={apps.error} onRetry={() => void apps.refetch()} />
+      ) : apps.data.length === 0 ? (
+        <EmptyState
+          icon={<Rocket className="size-5" />}
+          title="No apps yet"
+          description={can("developer") ? "Connect a repository to build and run it here." : "A developer or admin can add the first app."}
+          action={newApp || undefined}
+        />
+      ) : (
+        <ul className="divide-y divide-border rounded-xl border border-border bg-surface">
+          {apps.data.map((a) => (
+            <li
+              key={a.id}
+              className="relative flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 hover:bg-surface-2"
+            >
+              <AppStatusDot app={a} />
+              {/* The whole row opens the app via a stretched ::after, so the site link below is a sibling, not nested (A-179). */}
+              <Link
+                to={`${base}/${a.id}`}
+                className="min-w-0 flex-1 basis-40 truncate font-medium after:absolute after:inset-0"
+              >
+                {a.name}
+              </Link>
+              <Badge>{PRESETS[a.preset].label}</Badge>
+              {a.target !== "local" && <Badge tone="info">{TARGET_SHORT[a.target]}</Badge>}
+              <span className="truncate font-mono text-xs text-muted">{a.branch}</span>
+              <span className="basis-full text-xs text-muted sm:basis-auto sm:ml-auto">
+                {a.live_deployment ? `Deployed ${relativeTime(a.live_deployment.finished_at ?? a.live_deployment.created_at)}` : "Never deployed"}
+              </span>
+              {(a.urls[0] ?? a.local_url) && (
+                <a
+                  href={a.urls[0] ?? a.local_url ?? undefined}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="relative z-10 inline-flex items-center gap-1 font-mono text-xs text-accent hover:underline"
+                >
+                  {a.urls[0] ? "" : "On this server: "}
+                  {(a.urls[0] ?? a.local_url ?? "").replace(/^https?:\/\//, "")}
+                  <ExternalLink className="size-3" />
+                </a>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {creating && <NewAppDialog projectId={project.id} isAdmin={can("admin")} onClose={closeNew} />}
+    </div>
+  );
+}

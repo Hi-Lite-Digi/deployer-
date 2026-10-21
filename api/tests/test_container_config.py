@@ -1,0 +1,100 @@
+"""A-153: container settings have one source of truth (compose / Caddy), not repeats in the images."""
+
+import re
+from pathlib import Path
+
+import yaml
+
+from app import shell_runner
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def read(rel: str) -> str:
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
+def test_api_healthcheck_and_backup_dir_live_in_compose_only():
+    dockerfile = read("api/Dockerfile")
+    assert "HEALTHCHECK" not in dockerfile
+    assert "ENV BACKUP_DIR" not in dockerfile
+    compose = read("deploy/docker-compose.yml")
+    assert "BACKUP_DIR: /backups" in compose
+    assert "http://127.0.0.1:8000/v1/health" in compose
+
+
+def test_security_headers_are_set_by_caddy_not_nginx():
+    nginx = read("dashboard/nginx.conf")
+    assert "add_header X-Content-Type-Options" not in nginx
+    assert "add_header Referrer-Policy" not in nginx
+    caddy = read("deploy/Caddyfile")
+    assert 'X-Content-Type-Options "nosniff"' in caddy
+    assert "Referrer-Policy" in caddy
+
+
+def test_query_shell_sidecar_holds_no_secrets():
+    """A-001: mongosh (full Node.js for developers and service keys) runs only in the query-shell
+    service: no environment, volumes or Docker socket, capabilities dropped, reachable only from the
+    api, worker and mongodb. CI starts the same container for tests/integration/test_query_console.py."""
+    compose = yaml.safe_load(read("deploy/docker-compose.yml"))
+    services = compose["services"]
+    shell = services["query-shell"]
+    assert not {"environment", "env_file", "volumes", "build"} & set(shell)
+    assert shell["command"] == ["python", "-m", "app.shell_runner"] and shell["entrypoint"] == []
+    assert shell["cap_drop"] == ["ALL"] and shell["read_only"] is True and shell["init"] is True
+    assert "no-new-privileges:true" in shell["security_opt"]
+    assert shell["networks"] == ["query", "query_egress"] and compose["networks"]["query"]["internal"] is True
+    on = {
+        net: {name for name, svc in services.items() if net in (svc.get("networks") or [])}
+        for net in compose["networks"]
+    }
+    assert on["query"] == {"api", "worker", "mongodb", "query-shell"} and on["query_egress"] == {"query-shell"}
+    url = f"http://query-shell:{shell_runner.PORT}"
+    assert services["api"]["environment"]["QUERY_SHELL_URL"] == url
+    assert services["worker"]["environment"]["QUERY_SHELL_URL"] == url
+    ci = read(".github/workflows/ci.yml")
+    assert re.findall(r"--cap-add (\w+)", ci) == shell["cap_add"] and " --init " in ci
+    dockerfile = read("api/Dockerfile")
+    assert "for i in 1 2 3 4; do" in dockerfile and '--uid "2000$i"' in dockerfile
+    assert shell_runner.SLOT_UIDS == (20001, 20002, 20003, 20004)
+
+
+def test_untrusted_containers_share_no_network_with_the_api():
+    """A-019: apps (and apps with database access) never share a network with the API, and only the
+    tunnel shares one with Caddy that :8081 trusts. App networks come from the worker's environment."""
+    compose = yaml.safe_load(read("deploy/docker-compose.yml"))
+    services = compose["services"]
+    on = {
+        net: {name for name, svc in services.items() if net in (svc.get("networks") or [])}
+        for net in compose["networks"]
+    }
+    assert on["apps"] == {"caddy", "worker"} and on["tunnel"] == {"caddy", "tunnel"}
+    assert on["appdb"] == {"mariadb", "mongodb"} and compose["networks"]["appdb"]["internal"] is True
+    env = services["worker"]["environment"]
+    assert (env["APP_NETWORK"], env["APP_DB_NETWORK"]) == ("deployer_apps", "deployer_appdb")
+    assert not {"apps", "appdb", "tunnel"} & set(services["api"]["networks"])
+    assert services["tunnel"]["networks"] == ["tunnel"]
+    assert "--forwarded-allow-ips" not in read("api/Dockerfile") + read("deploy/docker-compose.dev.yml")
+
+
+def test_caddy_lets_every_import_upload_through():
+    """A-044: the dashboard imports through /projects/import/jobs; Caddy's 64 MB cap for other API
+    requests must not apply to it (the API's own limit is up to 1 GB)."""
+    caddy = read("deploy/Caddyfile")
+    imports = re.search(r"@imports path (.+)", caddy).group(1).split()
+    assert {"/v1/setup/import", "/v1/projects/import", "/v1/projects/import/jobs"} <= set(imports)
+    other = re.search(r"@api_other \{\s*path /v1/\*\s*not path (.+)", caddy).group(1).split()
+    assert set(imports) <= set(other)
+
+
+def test_migrations_run_to_completion_before_the_api_starts():
+    """L-01: a long migration (0012 rebuilds every DATETIME table) must not run inside the API's
+    healthcheck window, or `up` fails on an unhealthy API while the worker waits for it."""
+    services = yaml.safe_load(read("deploy/docker-compose.yml"))["services"]
+    migrate, api = services["migrate"], services["api"]
+    assert api["depends_on"]["migrate"] == {"condition": "service_completed_successfully"}
+    # Same image and entrypoint (alembic upgrade head) as the API, then exits.
+    assert migrate["image"] == api["image"] and "entrypoint" not in migrate
+    assert migrate["environment"] == api["environment"] and migrate["restart"] == "no"
+    assert "healthcheck" not in migrate
+    assert "alembic upgrade head" in read("api/docker-entrypoint.sh")

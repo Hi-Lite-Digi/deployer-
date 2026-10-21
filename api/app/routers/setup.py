@@ -1,0 +1,61 @@
+from fastapi import APIRouter, Request, Response
+from pydantic import BaseModel, Field
+
+from app import __version__
+from app.config import get_settings
+from app.deps import DbSession
+from app.errors import conflict
+from app.models import User
+from app.services import audit, tokens
+from app.services.instance_settings import allow_signup, is_initialized, oauth_app, public_url, reachable_elsewhere
+from app.services.passwords import Email, hash_password, validate_password
+
+router = APIRouter(tags=["setup"])
+
+
+@router.get("/setup/status")
+def setup_status(db: DbSession) -> dict:
+    return {
+        "initialized": is_initialized(db),
+        "version": __version__,
+        "public_url": public_url(db),
+        "reachable_elsewhere": reachable_elsewhere(db),
+        "providers": {p: oauth_app(db, p).configured for p in ("google", "github")},
+        "allow_signup": allow_signup(db),
+        "legacy_baas_enabled": get_settings().legacy_baas_enabled,
+        "device_mode": _device_mode(db),
+        # False on CPUs without AVX: the dashboard unticks the MongoDB box instead of failing "New project".
+        "managed_mongodb": get_settings().managed_mongodb_enabled,
+    }
+
+
+def _device_mode(db) -> str:
+    """docs/DEVICES.md: "host" when this installation is attached to a main Deployer."""
+    from app.services.device_host import device_mode
+
+    return device_mode(db)
+
+
+class OwnerIn(BaseModel):
+    email: Email
+    password: str
+    display_name: str | None = Field(default=None, max_length=120)
+
+
+@router.post("/setup/owner")
+def create_owner(body: OwnerIn, request: Request, response: Response, db: DbSession) -> dict:
+    if is_initialized(db):
+        raise conflict("already_initialized", "This instance already has an owner")
+    validate_password(body.password)
+    user = User(
+        email=body.email,
+        display_name=(body.display_name or "").strip() or None,
+        password_hash=hash_password(body.password),
+        is_instance_owner=True,
+    )
+    db.add(user)
+    db.flush()
+    audit.record(db, "auth.signup", request=request, user_id=user.id, method="password", instance_owner=True)
+    payload = tokens.start_session(db, response, user, request)
+    db.commit()
+    return payload

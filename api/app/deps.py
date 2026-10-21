@@ -1,0 +1,192 @@
+"""Shared FastAPI dependencies: current user and project role checks."""
+
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Annotated
+
+import jwt
+from fastapi import Depends, Request
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.crypto import sha256_hex
+from app.db import get_db
+from app.errors import ApiError, forbidden, not_found, unauthorized
+from app.models import ApiKey, Project, ProjectMember, User, role_rank, utcnow
+from app.services import rate_limit
+from app.services.instance_settings import api_key_rate_limit, owner_only_projects
+
+DbSession = Annotated[Session, Depends(get_db)]
+
+
+def decode_access_token(token: str) -> dict:
+    try:
+        claims = jwt.decode(token, get_settings().jwt_secret, algorithms=["HS256"], audience="deployer")
+    except jwt.PyJWTError as exc:
+        raise unauthorized("Invalid or expired access token") from exc
+    if claims.get("typ") != "access":
+        raise unauthorized("Invalid access token")
+    return claims
+
+
+def bearer_token(request: Request) -> str:
+    scheme, _, token = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise unauthorized()
+    return token
+
+
+def api_key_not_allowed() -> ApiError:
+    return ApiError(401, "api_key_not_allowed", "API keys can only call the data, query, schema and MCP endpoints")
+
+
+def get_current_user(request: Request, db: DbSession) -> User:
+    token = bearer_token(request)
+    if token.startswith(API_KEY_PREFIX):
+        raise api_key_not_allowed()
+    claims = decode_access_token(token)
+    user = db.get(User, claims["sub"])
+    if user is None or not user.is_active:
+        raise unauthorized("Account not found or disabled")
+    return user
+
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def require_instance_owner(user: CurrentUser) -> User:
+    if not user.is_instance_owner:
+        raise forbidden("Only the instance owner can do that")
+    return user
+
+
+InstanceOwner = Annotated[User, Depends(require_instance_owner)]
+
+
+def require_project_creator(user: CurrentUser, db: DbSession) -> User:
+    """Creating (or importing) a project provisions databases on this PC, so by default only the
+    instance owner may (instance setting `owner_only_projects`, A-023)."""
+    if not user.is_instance_owner and owner_only_projects(db):
+        raise forbidden(
+            "Only the instance owner can create projects on this Deployer. Ask them to create one and invite you to it."
+        )
+    return user
+
+
+ProjectCreator = Annotated[User, Depends(require_project_creator)]
+
+
+@dataclass
+class ProjectAccess:
+    project: Project
+    user: User  # for API keys: the key's creator, or the project owner if that account is gone
+    role: str
+    api_key: ApiKey | None = None
+
+    def at_least(self, role: str) -> bool:
+        return role_rank(self.role) >= role_rank(role)
+
+    @property
+    def api_key_id(self) -> str | None:
+        return self.api_key.id if self.api_key else None
+
+    @property
+    def is_anon_key(self) -> bool:
+        return self.api_key is not None and self.api_key.role == "anon"
+
+    @property
+    def is_service_key(self) -> bool:
+        return self.api_key is not None and self.api_key.role == "service"
+
+
+API_KEY_PREFIX = "dpl_"
+API_KEY_ROLES = {"anon": "viewer", "service": "developer"}
+LAST_USED_INTERVAL = timedelta(seconds=60)  # `last_used_at` is written at most this often per key
+
+
+def load_api_key_access(db: Session, token: str, project_id: str) -> ProjectAccess:
+    key = db.scalar(select(ApiKey).where(ApiKey.key_hash == sha256_hex(token)))
+    if key is None:
+        raise unauthorized("Invalid API key")
+    if key.project_id != project_id:
+        raise not_found("Project")  # don't reveal that the project exists
+    if key.revoked_at is not None:
+        raise ApiError(401, "api_key_revoked", "This API key has been revoked")
+    check_api_key_rate(db, key.id)
+    project = db.get(Project, project_id)
+    user = db.get(User, key.created_by_id) if key.created_by_id else None
+    # A-024: a creator who left the project (or is disabled) is no longer credited; the owner is.
+    is_member = user is not None and db.scalar(
+        select(ProjectMember.user_id).where(ProjectMember.project_id == project_id, ProjectMember.user_id == user.id)
+    )
+    if not is_member or not user.is_active:
+        user = db.get(User, project.owner_id)
+    if user is None or not user.is_active:
+        # The project's owner was disabled by the instance owner (A-023): their keys stop too.
+        raise ApiError(401, "account_disabled", "The account that owns this project has been disabled")
+    now = utcnow()
+    if key.last_used_at is None or now - key.last_used_at >= LAST_USED_INTERVAL:
+        key.last_used_at = now
+        db.commit()
+    return ProjectAccess(project=project, user=user, role=API_KEY_ROLES[key.role], api_key=key)
+
+
+def check_api_key_rate(db: Session, key_id: str) -> None:
+    """Per-key request limit (instance setting `api_key_rate_limit`, default 600/min, 0 = off);
+    separate from the MCP tool-call limit in routers/mcp.py."""
+    limit = api_key_rate_limit(db)
+    if limit <= 0:
+        return
+    allowed, retry_after = rate_limit.hit(f"rl:apikey:{key_id}", limit, 60)
+    if not allowed:
+        raise ApiError(
+            429,
+            "rate_limited",
+            f"Too many requests for this API key (limit {limit} per minute); try again later",
+            {"retry_after": retry_after},
+        )
+
+
+def load_project_access(db: Session, user: User, project_id: str) -> ProjectAccess:
+    project = db.get(Project, project_id)
+    if project is None:
+        raise not_found("Project")
+    member = db.scalar(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == user.id)
+    )
+    if member is None:
+        # Don't reveal that the project exists.
+        raise not_found("Project")
+    return ProjectAccess(project=project, user=user, role=member.role)
+
+
+def require_role(minimum: str, *, api_keys: bool = False, service_keys: bool = False):
+    """Dependency factory for routes with a `project_id` path parameter.
+
+    Usage: `access: Annotated[ProjectAccess, Depends(require_role("admin"))]`
+    `api_keys=True` also accepts a project API key (`dpl_...`, docs/DATA_API.md): anon keys act as
+    viewer, service keys as developer. Elsewhere a key gets 401 `api_key_not_allowed`.
+    `service_keys=True` also lets a service key through a route whose `minimum` is above developer (a
+    session still needs `minimum`); such a route asks for its own typed confirmation instead.
+    """
+
+    def dependency(project_id: str, request: Request, db: DbSession) -> ProjectAccess:
+        token = bearer_token(request)
+        if (api_keys or service_keys) and token.startswith(API_KEY_PREFIX):
+            access = load_api_key_access(db, token, project_id)
+        else:
+            access = load_project_access(db, get_current_user(request, db), project_id)
+        if not access.at_least(minimum) and not (service_keys and access.is_service_key):
+            if access.is_anon_key:  # A-196: say what to do, not which internal role the key maps to
+                raise forbidden("This anon key is read-only; use a service key to change data")
+            raise forbidden(f"Requires the {minimum} role or higher on this project")
+        return access
+
+    return dependency
+
+
+def client_ip(request: Request) -> str | None:
+    """The peer address. Behind Caddy, main.CaddyProxyHeaders has already set it from the one
+    X-Forwarded-For entry Caddy sends; never read the header here, anyone can send one (A-019)."""
+    return request.client.host if request.client else None

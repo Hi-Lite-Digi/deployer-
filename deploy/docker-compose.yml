@@ -1,0 +1,481 @@
+# Deployer - production stack.
+#
+# Normally started by the installer / `deployer` CLI (Windows or Linux), which writes `.env` next to this file
+# with locally generated secrets. For development: copy `.env.example` to `.env`, then
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Sized for old PCs (4 GB RAM total). Default memory limits, all overridable in `.env`:
+#   mariadb 512m (InnoDB buffer pool 128M) | mongodb 512m (WiredTiger cache 0.25 GB)
+#   redis 160m (maxmemory 128mb)           | api 768m (exports stream; imports <= 1/6 free)
+#   dashboard 64m (static nginx)           | caddy 128m
+#   tunnel 128m (cloudflared; idle unless remote access is enabled)
+#   worker 384m (backup jobs stream dumps; never buffers whole databases)
+#   query-shell 512m (up to 4 mongosh query console shells at once)
+# Roughly 3.1 GB worst case; typical idle usage is well under 1 GB. Deployed apps
+# (docs/DEPLOYMENTS.md) run as extra containers, APP_MEM_LIMIT (512m) each, on top of that.
+#
+# MongoDB 8.0 needs a CPU with AVX. It only starts when COMPOSE_PROFILES contains `mongodb`
+# (the installer omits it on CPUs without AVX and sets MANAGED_MONGODB_ENABLED=false).
+# Installs made before A-143 have MongoDB 5.0 data: `deployer update` lifts it one version at a time
+# with the `mongodb-upgrade-*` one-off services below, then sets MONGODB_IMAGE=mongo:8.0 in .env
+# (a .env without it keeps mongo:5.0, see the `mongodb` service; docs/BACKUPS.md).
+
+name: deployer
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# deploy/mongodb/upgrade.sh (A-143): each run lifts the stopped managed MongoDB's data one
+# feature-compatibility version, to the version of its image. Never started by `up` (own profile);
+# installer/lib/common.ps1 Update-DeployerMongo runs them with `docker compose run --rm`.
+x-mongodb-upgrade: &mongodb-upgrade
+  profiles: ["mongodb-upgrade"]
+  entrypoint: ["bash", "-c", "exec bash <(tr -d '\r' < /deployer-mongo/upgrade.sh)"]
+  network_mode: none
+  volumes:
+    - mongodb_data:/data/db
+    - ./mongodb:/deployer-mongo:ro
+    - ./mongodb/mongosh.conf:/etc/mongosh.conf:ro
+  mem_limit: ${MONGODB_MEM_LIMIT:-512m}
+  logging: *default-logging
+
+services:
+  mariadb:
+    image: mariadb:11
+    restart: unless-stopped
+    command:
+      - --innodb-buffer-pool-size=128M
+      - --innodb-log-buffer-size=8M
+      - --performance-schema=OFF
+      - --max-connections=150
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-name-resolve
+      # Point-in-time recovery (docs/BACKUPS.md): row-based binary log kept 8 days.
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --server-id=1
+      - --binlog-expire-logs-seconds=691200
+      - --log-slave-updates
+      # Co-hosting sync (docs/COHOSTING.md) reads column names/types from the binlog; the sync also
+      # sets this at runtime, the flag keeps it across restarts. Retention (8 days above) must stay >= 7.
+      - --binlog-row-metadata=FULL
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?MARIADB_ROOT_PASSWORD is not set - run the installer or create deploy/.env from .env.example}
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-deployer}
+      MARIADB_USER: ${MARIADB_USER:-deployer}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?MARIADB_PASSWORD is not set}
+      # Upgrade the system tables automatically when the mariadb:11 image moves to a newer minor.
+      MARIADB_AUTO_UPGRADE: "1"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      # Written by the worker (co-hosting auto_increment step/offset, docs/COHOSTING.md "Ids") so they
+      # survive restarts. A new volume starts with the image's own conf.d files.
+      - mariadb_conf:/etc/mysql/conf.d
+    networks:
+      - backend
+      # Apps with database access reach it here, without access to the backend network (A-019).
+      - appdb
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    mem_limit: ${MARIADB_MEM_LIMIT:-512m}
+    logging: *default-logging
+
+  mongodb:
+    # MONGODB_IMAGE is written to .env by the installer for a new install and by Update-DeployerMongo
+    # (installer/lib/common.ps1) once existing data is upgraded. The first update from a pre-A-143
+    # install is run by the previous `deployer` script, which knows neither, so without the key
+    # MongoDB stays on 5.0 (still able to open its data) until the next `deployer update`. A new
+    # major also needs a `mongodb-upgrade-<major>` step below (MongoDB opens data only from its own
+    # or the previous major) and the new image in Update-DeployerMongo / Initialize-DeployerEnv (and
+    # update_mongo / init_env in installer/deployer.sh, the Linux CLI).
+    image: ${MONGODB_IMAGE:-mongo:5.0}
+    profiles: ["mongodb"]
+    restart: unless-stopped
+    # Single-node replica set `rs0` (the oplog enables point-in-time recovery, docs/BACKUPS.md). The
+    # wrapper derives the member keyfile from MONGO_ROOT_PASSWORD; the worker initiates the set.
+    # CR characters are stripped so a Windows (CRLF) checkout still runs.
+    entrypoint: ["bash", "-c", "exec bash <(tr -d '\r' < /deployer-mongo/entrypoint.sh) \"$$@\"", "deployer-mongo"]
+    command: ["--replSet", "rs0", "--keyFile", "/tmp/deployer-mongo-keyfile", "--wiredTigerCacheSizeGB", "0.25", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is not set}
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./mongodb:/deployer-mongo:ro
+      # No telemetry, update checks or log files for the healthcheck's mongosh.
+      - ./mongodb/mongosh.conf:/etc/mongosh.conf:ro
+    networks:
+      - backend
+      # The query console's shells (query-shell) reach it here, without access to the backend network.
+      - query
+      - appdb
+    # Time for a clean shutdown (a killed mongod replays its journal on the next start).
+    stop_grace_period: 60s
+    healthcheck:
+      # Images since 6.0 only have mongosh (Node.js): slower to start than the old `mongo` shell, so
+      # a longer interval and timeout on old PCs. `ping` needs no authentication.
+      test: ["CMD", "mongosh", "--quiet", "--norc", "--eval", "db.adminCommand({ ping: 1 }).ok"]
+      interval: 30s
+      timeout: 20s
+      retries: 10
+      start_period: 60s
+    mem_limit: ${MONGODB_MEM_LIMIT:-512m}
+    logging: *default-logging
+
+  mongodb-upgrade-6:
+    <<: *mongodb-upgrade
+    image: mongo:6.0
+  mongodb-upgrade-7:
+    <<: *mongodb-upgrade
+    image: mongo:7.0
+  mongodb-upgrade-8:
+    <<: *mongodb-upgrade
+    image: mongo:8.0
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # The password is read from the environment so it never appears in `docker inspect` args.
+    command:
+      - sh
+      - -c
+      - exec redis-server --requirepass "$$REDISCLI_AUTH" --appendonly yes --maxmemory 128mb --maxmemory-policy volatile-lru --save ""
+    environment:
+      # redis-cli (used by the healthcheck) reads REDISCLI_AUTH automatically.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set}
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: ${REDIS_MEM_LIMIT:-160m}
+    logging: *default-logging
+
+  api:
+    image: ${DEPLOYER_IMAGE_PREFIX:-ghcr.io/nyx-ulrix/deployer}-api:${DEPLOYER_VERSION:-latest}
+    build:
+      # The installer keeps the source next to this file in ./src; in a git checkout it is ../
+      context: ${DEPLOYER_SOURCE_DIR:-..}/api
+    restart: unless-stopped
+    environment: &api-environment
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      LEGACY_BAAS_ENABLED: ${LEGACY_BAAS_ENABLED:-false}
+      MARIADB_HOST: mariadb
+      MARIADB_PORT: "3306"
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-deployer}
+      MARIADB_USER: ${MARIADB_USER:-deployer}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      # Per managed database user (A-025): one app cannot use up the connections Deployer needs.
+      MANAGED_DB_MAX_USER_CONNECTIONS: ${MANAGED_DB_MAX_USER_CONNECTIONS:-20}
+      MONGO_HOST: mongodb
+      MONGO_PORT: "27017"
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MANAGED_MONGODB_ENABLED: ${MANAGED_MONGODB_ENABLED:-true}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is not set}
+      MASTER_KEY: ${MASTER_KEY:?MASTER_KEY is not set}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-false}
+      # public_url falls back to http://localhost:<this port> when a remote hostname is removed.
+      DEPLOYER_HTTP_PORT: ${DEPLOYER_HTTP_PORT:-8080}
+      # Encrypted backup artifacts (docs/BACKUPS.md).
+      BACKUP_DIR: /backups
+      # Host devices (docs/DEVICES.md): the worker runs the device agent + device maintenance.
+      WORKER_PLUGINS: ${WORKER_PLUGINS:-app.services.device_worker}
+      # Disk alert (docs/MONITORING.md): `/` is inside the sparse WSL disk, which reports ~1 TB free
+      # however full the Windows drive under it is; /host-disk (below) reports that drive.
+      DEVICE_DISK_PATH: /host-disk
+      DEVICE_DISK_DRIVE: ${DEPLOYER_HOST_DRIVE:-}
+      # Tests only: lets a device use http://host.docker.internal as its main Deployer URL.
+      DEPLOYER_ALLOW_INSECURE_PRIMARY: ${DEPLOYER_ALLOW_INSECURE_PRIMARY:-}
+      # Query console (docs/QUERY_CONSOLE.md): MongoDB shell code runs in this sidecar, never here.
+      QUERY_SHELL_URL: http://query-shell:8090
+    volumes:
+      # Shared with the tunnel sidecar: desired.json (written by the API) / status.json.
+      - tunnel_state:/tunnel
+      - backups:/backups
+      # Any small folder of the install dir: only its free space is read (DEVICE_DISK_PATH).
+      - ./mongodb:/host-disk:ro
+    depends_on:
+      # L-01: migrations finish before the API starts, so its healthcheck window covers only uvicorn.
+      migrate:
+        condition: service_completed_successfully
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+        # mongodb is behind a profile (no AVX -> not started); don't block the API on it.
+        required: false
+    # External databases on this PC (A-027): Docker Desktop already defines this name; Docker Engine
+    # in WSL needs the mapping (it then reaches the WSL VM - use the PC's network IP for Windows ones).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      # backend: databases (no internet access). public: Caddy + outbound calls
+      # (OAuth token exchange, external databases such as MongoDB Atlas). query: the query-shell.
+      - backend
+      - public
+      - query
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    mem_limit: ${API_MEM_LIMIT:-768m}
+    logging: *default-logging
+
+  # One-shot database migrations (L-01), run on every `up` before the API starts. A migration that
+  # rebuilds a big table (0012) can take minutes on an old PC: compose waits for this container to
+  # exit with no time limit, whereas a slow API start would be marked unhealthy and fail `up` (the
+  # worker waits on the API's health). The API entrypoint still migrates too, a no-op by then, for
+  # restarts Docker does on its own (PC reboot, `deployer restart api`).
+  migrate:
+    image: ${DEPLOYER_IMAGE_PREFIX:-ghcr.io/nyx-ulrix/deployer}-api:${DEPLOYER_VERSION:-latest}
+    restart: "no"
+    command: ["true"]
+    environment: *api-environment
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    networks:
+      - backend
+    mem_limit: 384m
+    logging: *default-logging
+
+  # Background jobs and the backup scheduler (docs/BACKUPS.md): snapshots, log archiving, restores,
+  # verification, pruning. Same image as the API; starts after `migrate` and a healthy API.
+  # Push-to-deploy (docs/DEPLOYMENTS.md): the worker also builds app images and runs app containers,
+  # so it gets the Docker socket and runs as root: the socket is owned by root on the engine host and
+  # whoever holds it is root-equivalent anyway, so an unprivileged uid would only pretend otherwise.
+  # The API container keeps no socket and stays uid 10001 (SECURITY.md "Worker trust").
+  worker:
+    image: ${DEPLOYER_IMAGE_PREFIX:-ghcr.io/nyx-ulrix/deployer}-api:${DEPLOYER_VERSION:-latest}
+    restart: unless-stopped
+    entrypoint: []
+    command: ["python", "-m", "app.worker"]
+    user: "0:0"
+    environment:
+      <<: *api-environment
+      # App containers: memory limit per container and the compose network Caddy reaches them on
+      # (`apps`: only caddy and the worker join it, so apps can't reach the API directly - A-019).
+      APP_MEM_LIMIT: ${APP_MEM_LIMIT:-512m}
+      APP_NETWORK: deployer_apps
+      # Joined only by apps an admin gave database access (docs/DEPLOYMENTS.md "Database access"):
+      # just mariadb and mongodb are on it, never the API or Redis (A-019).
+      APP_DB_NETWORK: deployer_appdb
+      CADDY_APPS_DIR: /etc/caddy/apps
+      MARIADB_CONF_DIR: /mariadb-conf
+    volumes:
+      - backups:/backups
+      - mariadb_conf:/mariadb-conf
+      - caddy_apps:/etc/caddy/apps
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Co-host devices (docs/COHOSTING.md "Websites on both PCs"): RPC `apps.tunnel` runs in the
+      # worker and hands the apps tunnel's connector token to the tunnel sidecar (desired.json).
+      - tunnel_state:/tunnel
+      - ./mongodb:/host-disk:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+        required: false
+    networks:
+      - backend
+      - public
+      # Waits for a new app container's port before routing it (DockerCli.wait_tcp).
+      - apps
+      # Device-hosted sources: the device's worker runs their query console shells (query-shell).
+      - query
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      disable: true
+    stop_grace_period: 30s
+    mem_limit: ${WORKER_MEM_LIMIT:-384m}
+    logging: *default-logging
+
+  # Query console (docs/QUERY_CONSOLE.md, SECURITY.md "Query console"): runs the MongoDB shell code
+  # of project developers and service keys - full Node.js - away from every secret. Same image as the
+  # API, but no Deployer environment, no volumes, no Docker socket and a read-only filesystem; the
+  # API and worker send it a source's connection string and the code over the `query` network
+  # (app/shell_runner.py). Root only to run each shell under its own uid and clean up after it;
+  # every other capability is dropped. `query_egress` reaches external MongoDB servers (internet,
+  # this PC); nothing of Deployer is on it.
+  query-shell:
+    profiles: ["legacy-baas"]
+    image: ${DEPLOYER_IMAGE_PREFIX:-ghcr.io/nyx-ulrix/deployer}-api:${DEPLOYER_VERSION:-latest}
+    restart: unless-stopped
+    entrypoint: []
+    command: ["python", "-m", "app.shell_runner"]
+    # An init as PID 1 reaps the processes a script left behind once the slot cleanup kills them
+    # (the runner does not, so their zombies would use up pids_limit).
+    init: true
+    user: "0:0"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    shm_size: 16m
+    pids_limit: 256
+    cpus: 1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - query
+      - query_egress
+    mem_limit: ${QUERY_SHELL_MEM_LIMIT:-512m}
+    logging: *default-logging
+
+  dashboard:
+    image: ${DEPLOYER_IMAGE_PREFIX:-ghcr.io/nyx-ulrix/deployer}-dashboard:${DEPLOYER_VERSION:-latest}
+    build:
+      context: ${DEPLOYER_SOURCE_DIR:-..}/dashboard
+    restart: unless-stopped
+    networks:
+      - public
+    mem_limit: ${DASHBOARD_MEM_LIMIT:-64m}
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+      - dashboard
+    ports:
+      # DEPLOYER_BIND (written by the installer; unset = 127.0.0.1, this PC only). 0.0.0.0 = every
+      # interface (the Windows firewall still applies).
+      - "${DEPLOYER_BIND:-127.0.0.1}:${DEPLOYER_HTTP_PORT:-8080}:8080"
+      # Deployed apps (docs/DEPLOYMENTS.md): one listener per app in this range, same bind rule.
+      - "${DEPLOYER_BIND:-127.0.0.1}:8100-8199:8100-8199"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Generated `<app_id>.caddy` site files written by the worker (`import /etc/caddy/apps/*.caddy`).
+      - caddy_apps:/etc/caddy/apps
+      - caddy_data:/data
+      - caddy_config:/config
+    # A-019: :8081 (the tunnel's origin) takes the visitor IP from Cf-Connecting-Ip and the scheme from
+    # X-Forwarded-Proto only on connections from the `tunnel` network (caddy and tunnel only), whatever
+    # subnet Docker gave it: before Caddy starts this writes that subnet into the `servers :8081`
+    # options the Caddyfile imports. If it can't, :8081 trusts no forwarded headers at all. CI runs it
+    # with `caddy adapt` to check the result (.github/workflows/ci.yml).
+    entrypoint:
+      - sh
+      - -c
+      - |
+        f=/etc/caddy/tunnel-trust.caddy
+        rm -f "$$f"
+        addr=$$(getent hosts caddy-tunnel-origin | awk '{ print $$1; exit }')
+        net=$$(ip addr | awk -v a="$$addr/" '$$1 == "inet" && index($$2, a) == 1 { print $$2; exit }')
+        if [ -n "$$addr" ] && [ -n "$$net" ]; then
+          printf 'servers :8081 {\n\ttrusted_proxies static %s\n\tclient_ip_headers Cf-Connecting-Ip\n}\n' "$$net" > "$$f"
+        else
+          echo "caddy: tunnel network not found; :8081 trusts no forwarded headers" >&2
+        fi
+        exec caddy "$$@"
+      - caddy
+    command: ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    networks:
+      public: {}
+      # Deployed app containers (docs/DEPLOYMENTS.md); the API, dashboard and tunnel stay off it.
+      apps: {}
+      tunnel:
+        aliases: [caddy-tunnel-origin]
+    mem_limit: ${CADDY_MEM_LIMIT:-128m}
+    logging: *default-logging
+
+  # Cloudflare Tunnel connector (docs/REMOTE_ACCESS.md). Idle until the owner enables remote access
+  # in the dashboard; follows /tunnel/desired.json. No ports, no Docker socket; only outbound
+  # connections to Cloudflare and caddy:8081 on the `tunnel` network, which nothing else joins.
+  tunnel:
+    image: ${DEPLOYER_IMAGE_PREFIX:-ghcr.io/nyx-ulrix/deployer}-tunnel:${DEPLOYER_VERSION:-latest}
+    build:
+      context: ${DEPLOYER_SOURCE_DIR:-..}/deploy/tunnel
+    restart: unless-stopped
+    depends_on:
+      - caddy
+    environment:
+      # cloudflared's default QUIC transport needs outbound UDP 7844; home routers, ISPs and the WSL
+      # NAT can silently drop it (the connector then retries QUIC for minutes and the site is down
+      # with Cloudflare error 530). HTTP/2 over TCP 443 works wherever the PC can browse the web.
+      # Set TUNNEL_PROTOCOL=auto (or quic) in .env to prefer QUIC.
+      TUNNEL_TRANSPORT_PROTOCOL: ${TUNNEL_PROTOCOL:-http2}
+    volumes:
+      - tunnel_state:/tunnel
+    networks:
+      - tunnel
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,uid=10001,gid=10001,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: ${TUNNEL_MEM_LIMIT:-128m}
+    logging: *default-logging
+
+networks:
+  backend:
+    internal: true
+  public: {}
+  # Deployed apps (A-019): internet access for builds and outbound calls, but nothing of Deployer's
+  # except Caddy (and the worker) is on it.
+  apps: {}
+  # Apps with database access (A-019): only the databases, so such an app can't reach the API or Redis.
+  appdb:
+    internal: true
+  # cloudflared -> caddy:8081 (A-019): the only network whose clients :8081 trusts; internet access
+  # for the connector.
+  tunnel: {}
+  # Query console (A-001): only api, worker and mongodb reach the query-shell sidecar.
+  query:
+    internal: true
+  # The query-shell's way out to external MongoDB servers; nothing else is on it.
+  query_egress: {}
+
+volumes:
+  mariadb_data:
+  mariadb_conf:
+  mongodb_data:
+  mongodb_config:
+  redis_data:
+  caddy_data:
+  caddy_config:
+  caddy_apps:
+  tunnel_state:
+  backups:

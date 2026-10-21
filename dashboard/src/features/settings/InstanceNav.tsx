@@ -1,0 +1,18 @@
+import { Activity, Cloud, Globe, Server } from "lucide-react";
+import { NavTabs } from "../../components/ui/Tabs";
+
+/** Sub-navigation shared by the instance-owner settings pages. */
+export function InstanceNav() {
+  const icon = "size-4";
+  return (
+    <NavTabs
+      className="mb-5"
+      items={[
+        { to: "/settings/instance", label: "Instance", icon: <Server className={icon} /> },
+        { to: "/settings/remote-access", label: "Domains & remote access", icon: <Globe className={icon} /> },
+        { to: "/settings/cloud", label: "Cloud accounts", icon: <Cloud className={icon} /> },
+        { to: "/settings/monitoring", label: "Monitoring", icon: <Activity className={icon} /> },
+      ]}
+    />
+  );
+}

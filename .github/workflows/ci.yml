@@ -1,0 +1,494 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A-190: release.yml runs this whole suite before it pushes any image.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            api/requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      # A-194: the ruff config in pyproject.toml is enforced, not just advisory.
+      - name: Lint and format check (ruff)
+        run: ruff check . && ruff format --check .
+      - name: Run tests
+        # -rfEs also lists every skipped test with its reason (tests/integration runs in the job below).
+        run: pytest -rfEs
+
+  # A-092: the dashboard and tunnel images build on every push, not only on a release tag (a dead
+  # download or a changed checksum shows up here). The api image is built by the integration job.
+  images:
+    name: Docker image (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: dashboard
+            context: dashboard
+          - component: tunnel
+            context: deploy/tunnel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  # A-092: builds the api image, then runs inside it (it has the backup tools, mongosh, git and the
+  # Docker CLI) the unit suite on MariaDB and tests/integration against MariaDB 11 (row binlog, like
+  # deploy/docker-compose.yml) and MongoDB 8.0 (replica set rs0, the real deploy/mongodb wrapper).
+  integration:
+    name: API image + integration tests (MariaDB, MongoDB, Docker)
+    # ubuntu-22.04 (kernel 6.8): MongoDB 8 refuses Linux kernels 6.19 to 7.0.13 (SERVER-121912), and
+    # ubuntu-latest images from 2026-10-18 boot 7.0.0. Move back once runners have 7.0.14 or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the api image
+        uses: docker/build-push-action@v6
+        with:
+          context: api
+          platforms: linux/amd64
+          load: true
+          tags: deployer-api:ci
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+      - name: Start MariaDB 11 and MongoDB 8.0
+        run: |
+          set -eu
+          pw="$(openssl rand -hex 16)"
+          echo "::add-mask::$pw"
+          echo "IT_PW=$pw" >> "$GITHUB_ENV"
+          docker network create it
+          docker run -d --name mariadb --network it -e MARIADB_ROOT_PASSWORD="$pw" -e MARIADB_DATABASE=deployer_test \
+            mariadb:11 --log-bin=mysql-bin --binlog-format=ROW --server-id=1 --log-slave-updates \
+            --binlog-row-metadata=FULL --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+          docker run -d --name mongodb --network it -e MONGO_INITDB_ROOT_USERNAME=admin -e MONGO_INITDB_ROOT_PASSWORD="$pw" \
+            -v "$PWD/deploy/mongodb:/deployer-mongo:ro" --entrypoint bash mongo:8.0 \
+            /deployer-mongo/entrypoint.sh --replSet rs0 --keyFile /tmp/deployer-mongo-keyfile --bind_ip_all
+          for i in $(seq 1 60); do
+            if docker exec mariadb healthcheck.sh --connect --innodb_initialized >/dev/null 2>&1 \
+               && docker exec mongodb mongosh --quiet --norc -u admin -p "$pw" --authenticationDatabase admin \
+                    --eval 'db.adminCommand({ ping: 1 }).ok' >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$i" = 60 ]; then docker logs mariadb; docker logs mongodb; exit 1; fi
+            sleep 2
+          done
+          docker exec mongodb mongosh --quiet --norc -u admin -p "$pw" --authenticationDatabase admin \
+            --eval 'rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongodb:27017" }] })'
+          for i in $(seq 1 30); do
+            if [ "$(docker exec mongodb mongosh --quiet --norc -u admin -p "$pw" --authenticationDatabase admin \
+                     --eval 'db.hello().isWritablePrimary')" = "true" ]; then exit 0; fi
+            sleep 1
+          done
+          echo "::error::MongoDB did not become primary"; exit 1
+      # A-001: the query-shell service of deploy/docker-compose.yml (same user, capabilities, read-only
+      # filesystem and limits; tests/test_container_config.py keeps the capabilities in step).
+      - name: Start the query-shell sidecar
+        run: |
+          docker run -d --name query-shell --network it --init --user 0:0 --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add KILL --cap-add SETGID --cap-add SETUID \
+            --security-opt no-new-privileges:true --read-only --tmpfs /tmp:size=64m --shm-size 16m \
+            --pids-limit 256 --memory 512m --entrypoint python deployer-api:ci -m app.shell_runner
+      - name: Unit suite on MariaDB
+        run: |
+          docker run --rm --user root --network it -v "$PWD:/repo" -w /repo/api \
+            -e DEPLOYER_TEST_DATABASE_URL="mysql+pymysql://root:${IT_PW}@mariadb:3306/deployer_test?charset=utf8mb4" \
+            --entrypoint sh deployer-api:ci -c 'pip install -q -r requirements-dev.txt && python -m pytest -p no:cacheprovider -rfEs --ignore=tests/integration'
+      - name: Integration tests (no test may be skipped)
+        run: |
+          set -o pipefail
+          docker run --rm --user root --network it -v "$PWD:/repo" -w /repo/api \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e DEPLOYER_IT_MARIADB_URL="mysql://root:${IT_PW}@mariadb:3306" \
+            -e DEPLOYER_IT_MONGO_URI="mongodb://admin:${IT_PW}@mongodb:27017/?authSource=admin" \
+            -e QUERY_SHELL_URL=http://query-shell:8090 \
+            -e DEPLOYER_TEST_DOCKER=1 \
+            --entrypoint sh deployer-api:ci -c 'pip install -q -r requirements-dev.txt && python -m pytest -p no:cacheprovider -rfEs tests/integration' \
+            | tee "$RUNNER_TEMP/integration.log"
+          if grep -q '^SKIPPED' "$RUNNER_TEMP/integration.log"; then
+            echo "::error::Integration tests were skipped (see the SKIPPED lines above)"; exit 1
+          fi
+
+  dashboard:
+    name: Dashboard (lint, typecheck, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test -- --run
+      - run: npm run build
+
+  installer:
+    name: Installer (PowerShell checks, dry run, DeployerSetup.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse every PowerShell script
+        shell: powershell
+        run: |
+          $failed = $false
+          Get-ChildItem -Path . -Recurse -Include *.ps1 -File | Where-Object { $_.FullName -notmatch '\\node_modules\\' } | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              foreach ($e in $errors) { Write-Host "::error file=$($_.FullName),line=$($e.Extent.StartLineNumber)::$($e.Message)" }
+            } else {
+              Write-Host "OK  $($_.FullName)"
+            }
+            if ((Get-Content -LiteralPath $_.FullName -Raw) -match '[^\x00-\x7F]') {
+              $failed = $true
+              Write-Host "::error file=$($_.FullName)::Non-ASCII characters (Windows PowerShell 5.1 reads BOM-less scripts as ANSI)"
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: PSScriptAnalyzer (Error severity)
+        shell: powershell
+        run: |
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Set-PSRepository PSGallery -InstallationPolicy Trusted
+            Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          }
+          $results = Invoke-ScriptAnalyzer -Path installer -Recurse -Severity Error
+          $results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          if ($results) { exit 1 }
+      - name: Check shell script syntax (every tracked *.sh)
+        shell: bash
+        run: |
+          set -e
+          for f in $(git ls-files '*.sh'); do bash -n "$f" && echo "OK  $f"; done
+      - name: Keep-alive loop checks (no WSL needed)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/keepalive.tests.ps1; exit $LASTEXITCODE
+      - name: Dashboard port vs app port range checks
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/ports.tests.ps1; exit $LASTEXITCODE
+      - name: LAN access checks (port forward only, no mirrored networking)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/lan.tests.ps1; exit $LASTEXITCODE
+      - name: ARM64 is refused in preflight
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/arch.tests.ps1; exit $LASTEXITCODE
+      - name: WSL disk, logs and backups are not readable by Users
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/acl.tests.ps1; exit $LASTEXITCODE
+      - name: deployer restore commands (runtime paths, no PowerShell-expanded passwords)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/restore.tests.ps1; exit $LASTEXITCODE
+      - name: Uninstall restores sleep settings
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/keepawake.tests.ps1; exit $LASTEXITCODE
+      - name: .env merge never rotates secrets; argument quoting
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/env.tests.ps1; exit $LASTEXITCODE
+      - name: deployer update keeps the Apps & Features version in step
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/version.tests.ps1; exit $LASTEXITCODE
+      - name: Installer and update leave no downloads in %TEMP%
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/tempfiles.tests.ps1; exit $LASTEXITCODE
+      - name: An update never switches the runtime in place
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/runtime.tests.ps1; exit $LASTEXITCODE
+      - name: deployer update lifts MongoDB 5.0 data one version at a time
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/mongo.tests.ps1; exit $LASTEXITCODE
+      - name: The administrator window waits on an error and logs it
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/elevated.tests.ps1; exit $LASTEXITCODE
+      - name: The WSL step restarts only for a pending feature state
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer/tests/wslplatform.tests.ps1; exit $LASTEXITCODE
+      - name: install.ps1 -DryRun (read-only, prints progress markers)
+        shell: powershell
+        run: |
+          $out = powershell -NoProfile -ExecutionPolicy Bypass -File installer\install.ps1 -DryRun -NonInteractive | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) { Write-Host "::error::install.ps1 -DryRun exited with $code"; exit 1 }
+          foreach ($marker in @('##deployer:step 1/10 ', '##deployer:step 10/10 ', '##deployer:check windows ', '##deployer:done url=')) {
+            if (-not $out.Contains($marker)) { Write-Host "::error::Missing progress marker '$marker'"; exit 1 }
+          }
+      - name: Build DeployerSetup.exe
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File installer\windows\build.ps1 -Repo "${{ github.repository }}"
+      - name: Self-test DeployerSetup.exe (renders every page, live dry run)
+        shell: powershell
+        run: |
+          $outDir = Join-Path $PWD 'dist\selftest'
+          $p = Start-Process -FilePath dist\DeployerSetup.selftest.exe -ArgumentList '/selftest', "`"$outDir`"" -PassThru
+          if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; Write-Host '::error::Self-test timed out'; exit 1 }
+          Get-Content (Join-Path $outDir 'selftest-report.txt')
+          if ($p.ExitCode -ne 0) { Write-Host "::error::Self-test failed (exit code $($p.ExitCode))"; exit 1 }
+      - name: Upload DeployerSetup.exe and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployer-setup
+          path: |
+            dist/DeployerSetup.exe
+            dist/selftest/
+          if-no-files-found: warn
+
+  compose:
+    name: Compose file
+    # ubuntu-22.04: the MongoDB upgrade path needs a kernel MongoDB 8 starts on (see integration).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate with MongoDB profile
+        run: docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config --quiet
+      - name: Validate without MongoDB (CPU without AVX)
+        run: COMPOSE_PROFILES= MANAGED_MONGODB_ENABLED=false docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config --quiet
+      - name: Validate development overrides
+        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml --env-file deploy/.env.example config --quiet
+      - name: Validate Caddyfile
+        run: docker run --rm -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      # A-019: the caddy service's entrypoint finds the `tunnel` network's subnet and :8081 trusts
+      # Cf-Connecting-Ip from it only (without the generated file it trusts no forwarded headers).
+      - name: Caddy :8081 trusts the tunnel network
+        run: |
+          set -eu
+          out=$(docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example run --rm --no-deps --use-aliases caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile)
+          echo "$out" | grep -q 'Cf-Connecting-Ip'
+          echo "$out" | grep -q '"static"'
+      # A-143: the real deploy/mongodb scripts take a 5.0 replica set (as installed before A-143) to 8.0
+      # the way Update-DeployerMongo does, then the 8.0 service starts on it with the data intact.
+      - name: MongoDB 5.0 -> 8.0 upgrade path
+        run: |
+          set -eu
+          pw="$(openssl rand -hex 16)"
+          echo "::add-mask::$pw"
+          scripts="$PWD/deploy/mongodb"
+          docker network create up
+          docker volume create mdata
+          start() {  # start <image>: the compose `mongodb` service
+            docker run -d --name mongodb --network up -e MONGO_INITDB_ROOT_USERNAME=admin -e MONGO_INITDB_ROOT_PASSWORD="$pw" \
+              -v mdata:/data/db -v "$scripts:/deployer-mongo:ro" --entrypoint bash "$1" \
+              /deployer-mongo/entrypoint.sh --replSet rs0 --keyFile /tmp/deployer-mongo-keyfile --bind_ip_all
+          }
+          shell() {  # shell <mongo|mongosh> <code>
+            docker exec mongodb "$1" --quiet --norc -u admin -p "$pw" --authenticationDatabase admin --eval "$2"
+          }
+          wait_primary() {
+            for i in $(seq 1 60); do
+              if [ "$(shell "$1" 'db.hello().isWritablePrimary' 2>/dev/null)" = "true" ]; then return 0; fi
+              sleep 2
+            done
+            docker logs mongodb; exit 1
+          }
+          step() {  # step <image>: one compose `mongodb-upgrade-*` run; prints its exit code
+            set +e
+            docker run --rm --network none -v mdata:/data/db -v "$scripts:/deployer-mongo:ro" \
+              -v "$scripts/mongosh.conf:/etc/mongosh.conf:ro" --entrypoint bash "$1" /deployer-mongo/upgrade.sh >&2
+            echo $?
+            set -e
+          }
+          start mongo:5.0
+          for i in $(seq 1 60); do shell mongo 'db.adminCommand({ ping: 1 }).ok' >/dev/null 2>&1 && break; sleep 2; done
+          shell mongo 'rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongodb:27017" }] })'
+          wait_primary mongo
+          shell mongo 'db.getSiblingDB("app").items.insertOne({ _id: 1, v: "kept" })'
+          docker stop -t 60 mongodb && docker rm mongodb
+          # Volumes made before A-143 have no marker file.
+          docker run --rm -v mdata:/data/db --entrypoint rm mongo:5.0 -f /data/db/deployer-fcv
+          test "$(step mongo:8.0)" = 3
+          # 6.0 -> 7.0 -> 8.0, then 8.0 and 6.0 again are no-ops on 8.0 data.
+          for image in mongo:6.0 mongo:7.0 mongo:8.0 mongo:8.0 mongo:6.0; do test "$(step "$image")" = 0; done
+          start mongo:8.0
+          wait_primary mongosh
+          test "$(shell mongosh 'db.adminCommand({ getParameter: 1, featureCompatibilityVersion: 1 }).featureCompatibilityVersion.version')" = 8.0
+          test "$(shell mongosh 'db.getSiblingDB("app").items.findOne({ _id: 1 }).v')" = kept
+          docker exec mongodb mongosh --quiet --norc --eval 'db.adminCommand({ ping: 1 }).ok'
+
+  # The Linux installer and CLI (installer/install.sh, installer/deployer.sh) on a real headless Ubuntu
+  # VM with systemd: install from this checkout, every everyday command, the self-replacing update,
+  # backup + restore, and an uninstall that leaves nothing behind.
+  linux-installer:
+    # 22.04 (kernel 6.8) installs with managed MongoDB; ubuntu-latest (kernel 7.0.0, which MongoDB 8 refuses)
+    # checks that the installer turns it off with a reason and that everything else still works.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-latest]
+    name: Linux installer on ${{ matrix.os }} (install, CLI, update, uninstall)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      NO_COLOR: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        # Warnings and errors fail the job; info notes (e.g. SC2015 on the intended `a && b || die`) do not.
+        run: shellcheck -x -S warning installer/*.sh installer/wsl/*.sh deploy/mongodb/*.sh
+      - name: Install from this checkout (images built here)
+        run: sudo bash installer/install.sh --source-dir "$PWD" --from-source --yes
+      # These retained installer checks exercise the compatibility product. The default
+      # hosting API is covered by test_hosting_mode.py without this opt-in.
+      - name: Enable legacy service compatibility for installer regression checks
+        run: |
+          echo 'LEGACY_BAAS_ENABLED=true' | sudo tee -a /opt/deployer/.env >/dev/null
+          sudo deployer compose -- --profile legacy-baas up -d
+      - name: Installed layout and permissions
+        run: |
+          set -eux
+          test "$(readlink /usr/local/bin/deployer)" = /opt/deployer/installer/deployer.sh
+          test "$(sudo stat -c %a /opt/deployer/.env)" = 600
+          test "$(sudo stat -c %a /opt/deployer/backups)" = 700
+          systemctl is-enabled deployer.service
+          systemctl is-active deployer.service
+          sudo grep -q '^DEPLOYER_BIND=127.0.0.1$' /opt/deployer/.env
+          sudo grep -q '^MONGODB_IMAGE=mongo:8.0$' /opt/deployer/.env
+          curl -fsS http://127.0.0.1:8080/v1/health | grep -q '"status":"ok"'
+          # Managed MongoDB is on only where MongoDB 8 starts (kernel 6.8 on 22.04: it must be on there).
+          if sudo grep -q '^MANAGED_MONGODB_ENABLED=true$' /opt/deployer/.env; then
+            echo MONGO=1 >> "$GITHUB_ENV"
+          else
+            test "${{ matrix.os }}" != ubuntu-22.04
+            echo MONGO=0 >> "$GITHUB_ENV"
+            echo "::notice::Managed MongoDB turned off by the installer on kernel $(uname -r) (MongoDB SERVER-121912)"
+          fi
+      - name: Everyday commands
+        run: |
+          set -eux
+          deployer help | grep -q 'deployer actions'
+          sudo deployer status | tee status.txt
+          grep -q 'Health: ok' status.txt
+          grep -q 'Finish setup' status.txt
+          sudo deployer actions | tee actions.txt
+          grep -q 'Finish the setup wizard' actions.txt
+          sudo deployer guide | grep -q 'Domains & remote access'
+          sudo deployer config | grep -q 'MASTER_KEY *\*\*\*\*\*\*\*\*'
+          sudo deployer logs api --tail 5
+          sudo deployer compose -- ps --services | grep -qx api
+          sudo deployer oauth status | grep -q 'Callback URL: http://localhost:8080/v1/auth/oauth/github/callback'
+      - name: Owner account and password reset
+        run: |
+          set -eu  # no -x: the passwords and token below must not reach the log before ::add-mask::
+          pw="$(openssl rand -hex 12)"
+          echo "::add-mask::$pw"
+          curl -fsS -X POST -H 'Content-Type: application/json' http://127.0.0.1:8080/v1/setup/owner \
+            -d "{\"email\":\"owner@example.com\",\"password\":\"$pw\"}" >/dev/null
+          new="$(openssl rand -hex 12)"
+          echo "::add-mask::$new"
+          sudo env DEPLOYER_NEW_PASSWORD="$new" deployer reset-password | grep -q 'Password reset for owner@example.com'
+          tok="$(curl -fsS -X POST -H 'Content-Type: application/json' http://127.0.0.1:8080/v1/auth/login \
+            -d "{\"email\":\"owner@example.com\",\"password\":\"$new\"}" | jq -r .access_token)"
+          echo "::add-mask::$tok"
+          echo "OWNER_TOKEN=$tok" >> "$GITHUB_ENV"
+      # docs/MCP.md on this install, as an agent uses it: a project with both managed databases, a
+      # service key, then initialize, tools/list and run_query against MariaDB and (query-shell) MongoDB.
+      - name: MCP server for AI agents
+        run: |
+          set -eu  # no -x: the API key
+          api() { curl -fsS -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' "http://127.0.0.1:8080/v1$@"; }
+          nosql_on="$([ "$MONGO" = 1 ] && echo true || echo false)"
+          pid="$(api /projects -X POST -d "{\"name\":\"MCP check\",\"provision\":{\"sql\":true,\"nosql\":$nosql_on}}" | jq -r .id)"
+          key="$(api "/projects/$pid/api-keys" -X POST -d '{"name":"agent","role":"service"}' | jq -r .secret)"
+          echo "::add-mask::$key"
+          mcp() {
+            curl -fsS -X POST -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' "http://127.0.0.1:8080/v1/projects/$pid/mcp" -d "$1"
+          }
+          call() { jq -nc --arg n "$1" --argjson a "$2" '{jsonrpc: "2.0", id: 9, method: "tools/call", params: {name: $n, arguments: $a}}'; }
+          mcp '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' |
+            jq -e '.result.serverInfo.name == "deployer"'
+          mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq -e '[.result.tools[].name] | index("run_query") != null'
+          sources="$(mcp "$(call list_data_sources '{}')" | jq -r '.result.content[0].text')"
+          sql="$(jq -r '.[] | select(.kind == "sql") | .id' <<<"$sources")"
+          mcp "$(call run_query "$(jq -nc --arg s "$sql" '{source_id: $s, query: "SELECT 41 + 1 AS answer"}')")" | tee sql.json
+          jq -e '.result.isError == false and (.result.content[0].text | contains("42"))' sql.json
+          if [ "$MONGO" = 1 ]; then
+            nosql="$(jq -r '.[] | select(.kind == "nosql") | .id' <<<"$sources")"
+            mcp "$(call run_query "$(jq -nc --arg s "$nosql" '{source_id: $s, query: "db.runCommand({ ping: 1 })"}')")" | tee nosql.json
+            jq -e '.result.isError == false' nosql.json
+          fi
+      - name: Backup and restore
+        run: |
+          set -eux
+          sudo deployer backup --yes
+          stamp="$(sudo ls /opt/deployer/backups | sort | tail -n 1)"
+          sudo test -s "/opt/deployer/backups/$stamp/mariadb.sql"
+          [ "$MONGO" = 0 ] || sudo test -s "/opt/deployer/backups/$stamp/mongodb.archive.gz"
+          sudo deployer restore "$stamp" --yes
+          curl -fsS http://127.0.0.1:8080/v1/setup/status | grep -q '"initialized":true'
+      - name: Stop, start, port and LAN settings
+        run: |
+          set -eux
+          sudo deployer stop
+          if curl -fsS --max-time 5 http://127.0.0.1:8080/v1/health; then exit 1; fi
+          sudo deployer start
+          sudo deployer set-port 8090
+          curl -fsS http://127.0.0.1:8090/v1/health | grep -q '"status":"ok"'
+          sudo deployer lan on
+          sudo grep -q '^DEPLOYER_BIND=0.0.0.0$' /opt/deployer/.env
+          sudo deployer lan off
+          sudo deployer set-port 8080
+          curl -fsS http://127.0.0.1:8080/v1/health
+      - name: Update to this commit (downloaded from GitHub, replaces the running CLI)
+        run: |
+          set -eux
+          # The tested commit (a PR merge commit included) always lives in this repository, not in a fork.
+          sudo sed -i "s|^DEPLOYER_REPO=.*|DEPLOYER_REPO=${{ github.repository }}|" /opt/deployer/.env
+          sudo deployer update --ref "${{ github.sha }}" --from-source --yes
+          sudo grep -q '^DEPLOYER_REF=${{ github.sha }}$' /opt/deployer/.env
+          curl -fsS http://127.0.0.1:8080/v1/setup/status | grep -q '"initialized":true'
+          systemctl is-enabled deployer.service
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sudo deployer compose -- ps --all || true
+          sudo deployer logs --tail 80 || true
+          sudo journalctl -u deployer -n 80 --no-pager || true
+          sudo sh -c 'tail -n 80 /opt/deployer/logs/*.log' || true
+      - name: Uninstall leaves nothing behind
+        run: |
+          set -eux
+          sudo deployer uninstall --yes
+          test ! -e /opt/deployer
+          test ! -e /usr/local/bin/deployer
+          test ! -e /etc/systemd/system/deployer.service
+          test -z "$(docker ps -aq --filter label=com.docker.compose.project=deployer)"
+          test -z "$(docker volume ls -q --filter label=com.docker.compose.project=deployer)"
