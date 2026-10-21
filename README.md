@@ -80,6 +80,18 @@ region, server access and domain. No AWS resources are created by changing or pu
 - [AWS hosting and GitHub push-to-deploy setup](docs/AWS_HOSTING.md)
 - [Full documentation index and historical guides](docs/README.md)
 
+## Roadmap
+
+1. Hosting foundation: repository import, automatic push deployments and a hosting dashboard.
+2. AWS launch *(current)*: deploy EC2, configure HTTPS and GitHub OAuth, and verify real repository pushes.
+3. Operations: validate backup recovery, monitor capacity and strengthen isolation before supporting public tenants.
+
+## Security
+
+Use trusted repositories and keep server credentials and `deploy/.env` private. Follow
+[SECURITY.md](SECURITY.md) for vulnerability reporting and the
+[AWS hosting guide](docs/AWS_HOSTING.md) for server access and network configuration.
+
 ## Compatibility
 
 Legacy service code and metadata migrations are retained to avoid destroying existing installations.
