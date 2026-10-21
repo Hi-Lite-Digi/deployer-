@@ -75,6 +75,11 @@ The service test suite retains coverage of historical database features for migr
 Container integration tests require a running Docker daemon; AWS deployment requires your account,
 region, server access and domain. No AWS resources are created by changing or pushing this repository.
 
+## Documentation
+
+- [AWS hosting and GitHub push-to-deploy setup](docs/AWS_HOSTING.md)
+- [Full documentation index and historical guides](docs/README.md)
+
 ## Compatibility
 
 Legacy service code and metadata migrations are retained to avoid destroying existing installations.
